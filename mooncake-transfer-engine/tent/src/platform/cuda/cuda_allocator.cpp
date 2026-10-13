@@ -24,6 +24,7 @@
 #include <numa.h>
 #include <vector>
 #include <cstring>
+#include <exception>
 
 namespace mooncake {
 namespace tent {
@@ -108,22 +109,32 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
 
     // cudaMemcpyAsync() validates the stream against the current device's
     // context; pin the buffer's device for the copy and restore the caller's
-    // binding only when the thread already had a context.
-    int saved_device = 0;
-    const bool have_saved =
-        cudaHasCurrentContext() && cudaGetDevice(&saved_device) == cudaSuccess;
-    if (!have_saved) (void)cudaGetLastError();
-
-    CHECK_CUDA(cudaSetDevice(device_id));
-    CUDAStreamHandle stream;
-    CHECK_STATUS(getStreamFromPool(stream, device_id));
-    CHECK_CUDA(
-        cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
-    CHECK_CUDA(cudaStreamSynchronize(stream.get()));
-    if (have_saved) {
-        CHECK_CUDA(cudaSetDevice(saved_device));
+    // exact context, including an initially unbound thread.
+    CUcontext saved_context = nullptr;
+    CHECK_CU(cuCtxGetCurrent(&saved_context));
+    Status result;
+    std::exception_ptr exception;
+    try {
+        result = [&]() -> Status {
+            CHECK_CUDA(cudaSetDevice(device_id));
+            CUDAStreamHandle stream;
+            CHECK_STATUS(getStreamFromPool(stream, device_id));
+            CHECK_CUDA(cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault,
+                                       stream.get()));
+            CHECK_CUDA(cudaStreamSynchronize(stream.get()));
+            return Status::OK();
+        }();
+    } catch (...) {
+        exception = std::current_exception();
     }
-    return Status::OK();
+    const CUresult restored = cuCtxSetCurrent(saved_context);
+    if (restored != CUDA_SUCCESS) {
+        return Status::CudaError(
+            "cuCtxSetCurrent failed: " + std::to_string(restored) +
+            "; copy status: " + result.ToString());
+    }
+    if (exception) std::rethrow_exception(exception);
+    return result;
 }
 
 Status CudaPlatform::synchronizeDevices(const Topology* topology) {
