@@ -15,6 +15,7 @@ thread_local CUcontext current = reinterpret_cast<CUcontext>(0x777);
 std::string mode;
 std::array<unsigned char, 64> source{}, target{};
 int device = 7;
+unsigned restores = 0;
 }  // namespace
 extern "C" CUresult CUDAAPI cuInit(unsigned int) { return CUDA_SUCCESS; }
 extern "C" CUresult CUDAAPI cuCtxGetCurrent(CUcontext* out) {
@@ -22,7 +23,9 @@ extern "C" CUresult CUDAAPI cuCtxGetCurrent(CUcontext* out) {
     return mode == "query" ? CUDA_ERROR_INVALID_CONTEXT : CUDA_SUCCESS;
 }
 extern "C" CUresult CUDAAPI cuCtxSetCurrent(CUcontext saved) {
-    if (mode == "restore") return CUDA_ERROR_INVALID_CONTEXT;
+    ++restores;
+    if (mode == "restore" || mode == "throw-restore")
+        return CUDA_ERROR_INVALID_CONTEXT;
     current = saved;
     return CUDA_SUCCESS;
 }
@@ -92,7 +95,7 @@ std::vector<int> Platform::topologyDeviceIndices(const Topology*,
 CUDAStreamHandle::~CUDAStreamHandle() {}
 CUDAStreamPool::DevicePool::~DevicePool() {}
 Status CudaPlatform::getStreamFromPool(CUDAStreamHandle&, int) {
-    if (mode == "throw")
+    if (mode == "throw" || mode == "throw-restore")
         throw std::runtime_error("controlled stream exception");
     return mode == "stream" ? Status::CudaError("controlled stream error")
                             : Status::OK();
@@ -113,24 +116,51 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void*, size_t,
 int main() {
     unsigned errors = 0;
     for (const char* name : {"normal", "null", "query", "set", "stream", "copy",
-                             "sync", "restore", "throw"}) {
+                             "sync", "restore", "throw", "throw-restore"}) {
         mode = name;
         current = mode == "null" ? nullptr : reinterpret_cast<CUcontext>(0x777);
         auto saved = current;
+        restores = 0;
         source.fill(17);
         target.fill(0x5a);
         mooncake::tent::CudaPlatform platform(nullptr);
         bool ok = false, thrown = false;
+        bool error_preserved = true;
         try {
             auto status =
                 platform.copy(target.data(), source.data(), source.size());
             ok = status.ok();
-        } catch (const std::runtime_error&) {
+            if (mode == "restore")
+                error_preserved =
+                    status.IsCudaError() &&
+                    status.ToString().find("cuCtxSetCurrent failed") !=
+                        std::string::npos;
+        } catch (const std::runtime_error& error) {
             thrown = true;
+            if (mode == "throw")
+                error_preserved =
+                    std::string(error.what()) == "controlled stream exception";
+            if (mode == "throw-restore") {
+                error_preserved =
+                    std::string(error.what()).find("cuCtxSetCurrent failed") !=
+                    std::string::npos;
+                try {
+                    std::rethrow_if_nested(error);
+                    error_preserved = false;
+                } catch (const std::runtime_error& nested) {
+                    error_preserved =
+                        error_preserved && std::string(nested.what()) ==
+                                               "controlled stream exception";
+                }
+            }
         }
         bool expected_ok = mode == "normal" || mode == "null";
-        bool matched = (mode == "restore" || current == saved) &&
-                       ok == expected_ok && thrown == (mode == "throw");
+        bool matched = (mode == "restore" || mode == "throw-restore" ||
+                        current == saved) &&
+                       ok == expected_ok &&
+                       thrown == (mode == "throw" || mode == "throw-restore") &&
+                       error_preserved &&
+                       restores == (mode == "query" ? 0u : 1u);
         if (expected_ok) matched = matched && target == source;
         if (!matched) ++errors;
         std::cout << name << " ok=" << ok << " restored=" << (current == saved)

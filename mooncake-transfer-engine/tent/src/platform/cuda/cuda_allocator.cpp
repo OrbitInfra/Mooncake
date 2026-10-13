@@ -25,6 +25,7 @@
 #include <vector>
 #include <cstring>
 #include <exception>
+#include <stdexcept>
 
 namespace mooncake {
 namespace tent {
@@ -129,6 +130,14 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     }
     const CUresult restored = cuCtxSetCurrent(saved_context);
     if (restored != CUDA_SUCCESS) {
+        if (exception) {
+            try {
+                std::rethrow_exception(exception);
+            } catch (...) {
+                std::throw_with_nested(std::runtime_error(
+                    "cuCtxSetCurrent failed: " + std::to_string(restored)));
+            }
+        }
         return Status::CudaError(
             "cuCtxSetCurrent failed: " + std::to_string(restored) +
             "; copy status: " + result.ToString());
