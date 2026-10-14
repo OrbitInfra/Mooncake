@@ -24,6 +24,8 @@
 #include <numa.h>
 #include <vector>
 #include <cstring>
+#include <exception>
+#include <stdexcept>
 
 namespace mooncake {
 namespace tent {
@@ -127,53 +129,70 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     }
 
     Status status;
-    cudaError_t err = cudaSetDevice(device_id);
-    if (err != cudaSuccess) {
-        status = Status::InternalError(std::string("cudaSetDevice: ") +
-                                       cudaGetErrorString(err) + LOC_MARK);
-    } else {
-        // The handle returns the stream to the pool at the end of this scope,
-        // before the caller's state is restored below.
-        CUDAStreamHandle stream;
-        status = getStreamFromPool(stream, device_id);
-        if (status.ok()) {
-            err = cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault,
-                                  stream.get());
-            if (err != cudaSuccess) {
-                status =
-                    Status::InternalError(std::string("cudaMemcpyAsync: ") +
-                                          cudaGetErrorString(err) + LOC_MARK);
+    std::exception_ptr operation_exception;
+    cudaError_t err = cudaSuccess;
+    try {
+        err = cudaSetDevice(device_id);
+        if (err != cudaSuccess) {
+            status = Status::InternalError(std::string("cudaSetDevice: ") +
+                                           cudaGetErrorString(err) + LOC_MARK);
+        } else {
+            // The handle returns the stream to the pool at the end of this
+            // scope, before the caller's state is restored below.
+            CUDAStreamHandle stream;
+            status = getStreamFromPool(stream, device_id);
+            if (status.ok()) {
+                err = cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault,
+                                      stream.get());
+                if (err != cudaSuccess) {
+                    status = Status::InternalError(
+                        std::string("cudaMemcpyAsync: ") +
+                        cudaGetErrorString(err) + LOC_MARK);
+                }
+            }
+            if (status.ok()) {
+                err = cudaStreamSynchronize(stream.get());
+                if (err != cudaSuccess) {
+                    status = Status::InternalError(
+                        std::string("cudaStreamSynchronize: ") +
+                        cudaGetErrorString(err) + LOC_MARK);
+                }
             }
         }
-        if (status.ok()) {
-            err = cudaStreamSynchronize(stream.get());
-            if (err != cudaSuccess) {
-                status = Status::InternalError(
-                    std::string("cudaStreamSynchronize: ") +
-                    cudaGetErrorString(err) + LOC_MARK);
-            }
-        }
+    } catch (...) {
+        operation_exception = std::current_exception();
     }
 
     // Restore on every exit path, success or failure. cudaSetDevice() first
     // brings the runtime binding back (and may swap in that device's primary
     // context), then cuCtxSetCurrent() restores the exact context identity: a
     // custom CUcontext, or none at all for a caller that started bare.
+    cudaError_t runtime_restore_rc = cudaSuccess;
     if (caller_device != -1 && caller_device != device_id) {
-        err = cudaSetDevice(caller_device);
-        if (status.ok() && err != cudaSuccess) {
-            status =
-                Status::InternalError(std::string("cudaSetDevice(restore): ") +
-                                      cudaGetErrorString(err) + LOC_MARK);
-        }
+        runtime_restore_rc = cudaSetDevice(caller_device);
     }
     const CUresult restore_rc = cuCtxSetCurrent(caller_ctx);
-    if (status.ok() && restore_rc != CUDA_SUCCESS) {
-        status = Status::InternalError(
-            std::string("cuCtxSetCurrent failed to restore the caller "
-                        "context") +
-            LOC_MARK);
+    if (runtime_restore_rc != cudaSuccess || restore_rc != CUDA_SUCCESS) {
+        std::string message;
+        if (runtime_restore_rc != cudaSuccess) {
+            message = std::string("cudaSetDevice(restore): ") +
+                      cudaGetErrorString(runtime_restore_rc);
+        }
+        if (restore_rc != CUDA_SUCCESS) {
+            message +=
+                "; cuCtxSetCurrent failed: " + std::to_string(restore_rc);
+        }
+        if (operation_exception) {
+            try {
+                std::rethrow_exception(operation_exception);
+            } catch (...) {
+                std::throw_with_nested(std::runtime_error(message));
+            }
+        }
+        return Status::InternalError(message +
+                                     "; copy status: " + status.ToString());
     }
+    if (operation_exception) std::rethrow_exception(operation_exception);
     if (!status.ok()) {
         LOG(ERROR) << "CudaPlatform::copy failed: " << status.message();
     }
