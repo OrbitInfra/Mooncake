@@ -75,7 +75,9 @@ Status CudaPlatform::allocate(void** pptr, size_t size,
 }
 
 Status CudaPlatform::free(void* ptr, size_t size) {
-    if (getCudaDeviceForPtr(ptr) >= 0) {
+    int device = -1;
+    CHECK_CU(getCudaDeviceForPtr(ptr, device));
+    if (device >= 0) {
         CHECK_CUDA(cudaFree(ptr));
     } else {
         numa_free(ptr, size);
@@ -95,9 +97,10 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     // may live on cuda:R; taking the stream from the buffer's device routes the
     // copy correctly without mutating the calling thread's current device.
     // Host-only copies keep the current device.
-    int device_id = getPointerDeviceId(dst);
+    int device_id = CUDAStreamPool::kCurrentDevice;
+    CHECK_STATUS(getPointerDeviceId(dst, device_id));
     if (device_id == CUDAStreamPool::kCurrentDevice) {
-        device_id = getPointerDeviceId(src);
+        CHECK_STATUS(getPointerDeviceId(src, device_id));
     }
     if (device_id == CUDAStreamPool::kCurrentDevice) {
         // Host-to-host: plain memcpy. The stream pool would create a primary

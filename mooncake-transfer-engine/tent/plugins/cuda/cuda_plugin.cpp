@@ -89,7 +89,9 @@ static int cuda_alloc(void* ctx_, void** pptr, size_t size, const char* loc) {
 static int cuda_free(void* ctx_, void* ptr, size_t size) {
     (void)ctx_;
     (void)size;
-    if (getCudaDeviceForPtr(ptr) < 0) return -2;
+    int device = -1;
+    if (getCudaDeviceForPtr(ptr, device) != CUDA_SUCCESS) return -1;
+    if (device < 0) return -2;
     CHECK_CUDA(cudaFree(ptr));
     return 0;
 }
@@ -97,8 +99,9 @@ static int cuda_free(void* ctx_, void* ptr, size_t size) {
 static int cuda_memcpy_sync(void* ctx_, void* dst, void* src, size_t length) {
     (void)ctx_;
     // Pin the owning device so the runtime does not default to GPU 0.
-    int dev = getCudaDeviceForPtr(src);
-    if (dev < 0) dev = getCudaDeviceForPtr(dst);
+    int dev = -1;
+    if (getCudaDeviceForPtr(src, dev) != CUDA_SUCCESS) return -1;
+    if (dev < 0 && getCudaDeviceForPtr(dst, dev) != CUDA_SUCCESS) return -1;
     if (dev < 0) return -1;  // host-to-host; let the caller fall back
     CHECK_CUDA(cudaSetDevice(dev));
     CHECK_CUDA(cudaMemcpy(dst, src, length, cudaMemcpyDefault));
@@ -109,7 +112,8 @@ static int cuda_query_location(void* ctx_, void* addr, size_t size,
                                location_t* buf, size_t buf_count) {
     (void)ctx_;
     if (buf_count == 0) return -1;
-    int dev = getCudaDeviceForPtr(addr);
+    int dev = -1;
+    if (getCudaDeviceForPtr(addr, dev) != CUDA_SUCCESS) return -1;
     if (dev < 0) return 0;
     buf[0].start = addr;
     buf[0].length = size;

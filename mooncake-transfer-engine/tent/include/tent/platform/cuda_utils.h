@@ -31,20 +31,28 @@ inline bool ensureCudaDriverInit() {
     return result == CUDA_SUCCESS;
 }
 
-// Device ordinal owning `ptr`, or -1 for host memory. Unlike the runtime
+// On CUDA_SUCCESS, `device` is the device ordinal, or -1 for host memory.
+// Errors never classify a pointer as host. Unlike the runtime
 // cudaPointerGetAttributes(), this never implicitly initializes the calling
 // thread's current device and its primary context (default GPU 0).
-inline int getCudaDeviceForPtr(const void* ptr) {
-    if (!ensureCudaDriverInit()) return -1;
+inline CUresult getCudaDeviceForPtr(const void* ptr, int& device) {
+    device = -1;
+    if (!ensureCudaDriverInit()) return CUDA_ERROR_NOT_INITIALIZED;
     unsigned int mem_type = 0;
-    CUresult res = cuPointerGetAttribute(
-        &mem_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)ptr);
-    if (res != CUDA_SUCCESS || mem_type != CU_MEMORYTYPE_DEVICE) return -1;
-    unsigned int dev_ordinal = 0;
-    res = cuPointerGetAttribute(
-        &dev_ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)ptr);
-    if (res != CUDA_SUCCESS) return -1;
-    return static_cast<int>(dev_ordinal);
+    int ordinal = -1;
+    CUpointer_attribute attributes[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                                        CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL};
+    void* values[] = {&mem_type, &ordinal};
+    const auto result = cuPointerGetAttributes(
+        2, attributes, values, reinterpret_cast<CUdeviceptr>(ptr));
+    if (result != CUDA_SUCCESS) return result;
+    if (mem_type == 0 || mem_type == CU_MEMORYTYPE_HOST) return CUDA_SUCCESS;
+    if ((mem_type != CU_MEMORYTYPE_DEVICE &&
+         mem_type != CU_MEMORYTYPE_UNIFIED) ||
+        ordinal < 0)
+        return CUDA_ERROR_INVALID_VALUE;
+    device = ordinal;
+    return CUDA_SUCCESS;
 }
 
 }  // namespace tent

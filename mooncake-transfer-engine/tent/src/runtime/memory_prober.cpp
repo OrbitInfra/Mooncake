@@ -181,9 +181,19 @@ Status MemoryProber::free(void* ptr, size_t size) {
 
 Status MemoryProber::memcpy(void* dst, void* src, size_t size) {
     for (auto& p : plugins_) {
-        if (!p.iface.memcpy_sync) continue;
+        if (!p.iface.memcpy_sync || !p.iface.query_location) continue;
+        location_t source_location{}, target_location{};
+        const int source =
+            p.iface.query_location(p.ctx, src, size, &source_location, 1);
+        const int target =
+            p.iface.query_location(p.ctx, dst, size, &target_location, 1);
+        if (source < 0 || target < 0 || source > 1 || target > 1)
+            return Status::InvalidArgument(
+                "Device pointer classification failed");
+        if (source == 0 && target == 0) continue;
         int rc = p.iface.memcpy_sync(p.ctx, dst, src, size);
         if (rc == 0) return Status::OK();
+        return Status::InternalError("Device plugin copy failed");
     }
 
     // If all plugins cannot execute memcpy_sync, use glibc
@@ -254,6 +264,8 @@ const std::vector<RangeLocation> MemoryProber::locate(void* addr, size_t size,
     for (auto& p : plugins_) {
         if (!p.iface.query_location) continue;
         int rc = p.iface.query_location(p.ctx, addr, size, list_buf, 64);
+        if (rc < 0 || rc > 64)
+            return {{(uint64_t)addr, size, kWildcardLocation}};
         if (rc > 0) {
             std::vector<RangeLocation> out;
             for (int i = 0; i < rc; ++i) {
@@ -272,6 +284,7 @@ std::string MemoryProber::type(void* addr) {
         location_t list_buf;
         if (!p.iface.query_location) continue;
         int rc = p.iface.query_location(p.ctx, addr, 1, &list_buf, 1);
+        if (rc < 0 || rc > 1) return kWildcardLocation;
         if (rc > 0) return LocationParser(list_buf.location).type();
     }
     return "cpu";

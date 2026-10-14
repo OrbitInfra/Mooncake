@@ -353,6 +353,54 @@ if(USE_CUDA)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 endif()
 
+if(USE_CUDA)
+  add_executable(
+    tent_cuda_pointer_test
+    cuda_pointer_classification_test.cpp
+    ../src/platform/cuda/cuda_allocator.cpp ../src/runtime/memory_prober.cpp)
+  target_compile_definitions(tent_cuda_pointer_test PRIVATE USE_CUDA)
+  target_include_directories(
+    tent_cuda_pointer_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+            ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(
+    tent_cuda_pointer_test PRIVATE tent_common glog::glog numa pthread
+                                   ${CMAKE_DL_LIBS})
+  set_target_properties(tent_cuda_pointer_test PROPERTIES ENABLE_EXPORTS ON)
+  add_library(tent_cuda_pointer_plugin SHARED ../plugins/cuda/cuda_plugin.cpp)
+  target_include_directories(
+    tent_cuda_pointer_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                                     ${CUDAToolkit_INCLUDE_DIRS})
+  target_compile_features(tent_cuda_pointer_plugin PRIVATE cxx_std_20)
+  target_link_libraries(tent_cuda_pointer_plugin PRIVATE glog::glog)
+  set_target_properties(
+    tent_cuda_pointer_plugin
+    PROPERTIES LIBRARY_OUTPUT_DIRECTORY
+               ${CMAKE_CURRENT_BINARY_DIR}/pointer-test-plugins)
+  add_dependencies(tent_cuda_pointer_test tent_cuda_pointer_plugin)
+  foreach(
+    case
+    device
+    host
+    registered-host
+    managed
+    driver
+    query
+    ordinal
+    unknown
+    invalid-ordinal)
+    add_test(NAME tent_cuda_pointer_${case} COMMAND tent_cuda_pointer_test
+                                                    ${case})
+    add_test(NAME tent_cuda_pointer_plugin_${case}
+             COMMAND tent_cuda_pointer_test ${case}
+                     $<TARGET_FILE_DIR:tent_cuda_pointer_plugin>)
+  endforeach()
+  add_test(NAME tent_cuda_pointer_plugin_copy_error
+           COMMAND tent_cuda_pointer_test copy-error
+                   $<TARGET_FILE_DIR:tent_cuda_pointer_plugin>)
+endif()
+
 # NOT registered via add_test: needs a real GPU with POSIX-FD VMM support (the
 # peer buffer is exported by a forked child and imported via pidfd_getfd). Run
 # manually on a GPU box: ./tent_mnnvl_transport_test. MNNVL targets fully

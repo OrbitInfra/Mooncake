@@ -298,19 +298,22 @@ bool cudaAbiMatches() {
 }  // namespace
 
 MemoryType CudaPlatform::getMemoryType(void* addr) {
-    if (!cudaDevicePresent()) return MTYPE_CPU;
+    if (!cudaDevicePresent()) return MTYPE_UNKNOWN;
     if (!cudaAbiMatches()) return MTYPE_UNKNOWN;
-    return getCudaDeviceForPtr(addr) >= 0 ? MTYPE_CUDA : MTYPE_CPU;
+    int device = -1;
+    if (getCudaDeviceForPtr(addr, device) != CUDA_SUCCESS) return MTYPE_UNKNOWN;
+    return device >= 0 ? MTYPE_CUDA : MTYPE_CPU;
 }
 
-int CudaPlatform::getPointerDeviceId(void* addr) {
+Status CudaPlatform::getPointerDeviceId(void* addr, int& device) {
     // Same guards as getMemoryType().
     if (!cudaDevicePresent() || !cudaAbiMatches()) {
-        return CUDAStreamPool::kCurrentDevice;
+        return Status::CudaError(
+            "CUDA device or runtime ABI unavailable for pointer "
+            "classification");
     }
-    int device = getCudaDeviceForPtr(addr);
-    if (device < 0) return CUDAStreamPool::kCurrentDevice;
-    return device;
+    CHECK_CU(getCudaDeviceForPtr(addr, device));
+    return Status::OK();
 }
 
 static inline uintptr_t alignPage(uintptr_t address) {
@@ -334,13 +337,17 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
-    if (cudaDevicePresent() && !cudaAbiMatches()) {
+    if (!cudaDevicePresent() || !cudaAbiMatches()) {
         entries.push_back({(uint64_t)start, len, kWildcardLocation});
         return entries;
     }
     if (cudaDevicePresent()) {
         // Unregistered pointers fall through to the NUMA probe below.
-        int cuda_dev = getCudaDeviceForPtr(start);
+        int cuda_dev = -1;
+        if (getCudaDeviceForPtr(start, cuda_dev) != CUDA_SUCCESS) {
+            entries.push_back({(uint64_t)start, len, kWildcardLocation});
+            return entries;
+        }
         if (cuda_dev >= 0) {
             entries.push_back(
                 {(uint64_t)start, len, genCudaNodeName(cuda_dev)});

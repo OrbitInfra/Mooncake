@@ -129,7 +129,7 @@ class CudaPlatform : public Platform {
 
    private:
     // Device owning `addr`, or kCurrentDevice when `addr` is not device memory.
-    int getPointerDeviceId(void* addr);
+    Status getPointerDeviceId(void* addr, int& device);
 
     std::shared_ptr<Config> conf;
     CUDAStreamPool stream_pool;
