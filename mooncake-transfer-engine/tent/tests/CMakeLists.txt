@@ -188,12 +188,12 @@ target_include_directories(local_notification_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME local_notification_test COMMAND local_notification_test)
 
-# Notification fallback: an unavailable RDMA notification channel falls back
-# to the next transport and then to the control-plane RPC, and receive drains
-# every transport. Loopback only, no NIC required.
+# Notification fallback: an unavailable RDMA notification channel falls back to
+# the next transport and then to the control-plane RPC, and receive drains every
+# transport. Loopback only, no NIC required.
 add_executable(tent_notification_fallback_test notification_fallback_test.cpp)
-target_link_libraries(tent_notification_fallback_test
-                      PRIVATE gtest gtest_main tent_link_group)
+target_link_libraries(tent_notification_fallback_test PRIVATE gtest gtest_main
+                                                              tent_link_group)
 target_include_directories(tent_notification_fallback_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_notification_fallback_test
@@ -354,6 +354,7 @@ if(USE_CUDA)
 endif()
 
 if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
   add_executable(
     tent_cuda_pointer_test
     cuda_pointer_classification_test.cpp
@@ -373,7 +374,7 @@ if(USE_CUDA)
     tent_cuda_pointer_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
                                      ${CUDAToolkit_INCLUDE_DIRS})
   target_compile_features(tent_cuda_pointer_plugin PRIVATE cxx_std_20)
-  target_link_libraries(tent_cuda_pointer_plugin PRIVATE glog::glog)
+  target_link_libraries(tent_cuda_pointer_plugin PRIVATE glog::glog tent_plugin)
   set_target_properties(
     tent_cuda_pointer_plugin
     PROPERTIES LIBRARY_OUTPUT_DIRECTORY
@@ -872,8 +873,7 @@ set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
 
 # Fabric transport: attribute codec and slicing math, plus end-to-end cases on
 # libfabric's tcp;ofi_rxm provider (no fabric hardware needed). Each e2e case
-# forks a server before the client engine starts, so it runs in its own
-# process.
+# forks a server before the client engine starts, so it runs in its own process.
 if(TARGET tent_xport_fabric)
   add_executable(tent_fabric_attrs_test fabric_attrs_test.cpp)
   target_link_libraries(tent_fabric_attrs_test PRIVATE gtest gtest_main
