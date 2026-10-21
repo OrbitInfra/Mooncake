@@ -16,6 +16,7 @@
 
 #include <cassert>
 #include <filesystem>
+#include <map>
 #include <set>
 
 #include "tent/common/status.h"
@@ -134,6 +135,21 @@ Status SegmentTracker::addInBatch(
     } else {
         new_desc_list = std::move(desc_list);
     }
+    std::map<std::pair<uint64_t, uint64_t>, size_t> unique_ranges;
+    size_t unique_count = 0;
+    for (size_t i = 0; i < new_desc_list.size(); ++i) {
+        auto& entry = new_desc_list[i];
+        auto [it, inserted] = unique_ranges.emplace(
+            std::make_pair(entry.addr, entry.length), unique_count);
+        if (inserted) {
+            if (unique_count != i)
+                new_desc_list[unique_count] = std::move(entry);
+            ++unique_count;
+        } else {
+            ++new_desc_list[it->second].ref_count;
+        }
+    }
+    new_desc_list.resize(unique_count);
     auto status = callback(new_desc_list);
     if (!status.ok()) {
         // Roll back the duplicate ref-counts so a failed registration does

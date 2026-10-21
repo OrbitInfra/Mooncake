@@ -785,88 +785,220 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     return result;
 }
 
+static bool sameRegistrationOptions(const MemoryOptions& left,
+                                    const MemoryOptions& right) {
+    return left.type == right.type && left.perm == right.perm &&
+           left.location == right.location && left.shm_path == right.shm_path &&
+           left.shm_offset == right.shm_offset && left.internal == right.internal;
+}
+
 Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                                                std::vector<size_t> size_list,
                                                MemoryOptions& options) {
-    if (addr_list.size() != size_list.size()) {
+    if (addr_list.size() != size_list.size())
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
-    }
-    auto transports = getSupportedTransports(options.type);
-    if (transports.empty()) {
-        return Status::InvalidArgument(
-            "No available transport for registerLocalMemory" LOC_MARK);
-    }
-
-    if (metadata_->sourceClosed())
-        return Status::InvalidArgument("Source admission permanently closed");
     std::vector<uint64_t> addresses;
     addresses.reserve(addr_list.size());
-    for (auto addr : addr_list)
-        addresses.push_back(reinterpret_cast<uint64_t>(addr));
+    for (size_t i = 0; i < addr_list.size(); ++i) {
+        const auto base = reinterpret_cast<uint64_t>(addr_list[i]);
+        if (!base || !size_list[i] ||
+            size_list[i] > std::numeric_limits<uint64_t>::max() - base)
+            return Status::InvalidArgument("Invalid registration range" LOC_MARK);
+        addresses.push_back(base);
+    }
+    const auto transports = getSupportedTransports(options.type);
+    if (transports.empty())
+        return Status::InvalidArgument(
+            "No available transport for registerLocalMemory" LOC_MARK);
+    if (metadata_->sourceClosed())
+        return Status::InvalidArgument("Source admission permanently closed");
     auto registration_guard = registration_coordinator_.acquire(addresses);
     releasePublishedPrefixes(addr_list, addr_list.size());
-    {
-        std::lock_guard<std::mutex> lock(retired_registration_mutex_);
-        for (const auto& entry : retired_registrations_) {
-            if (std::find(addresses.begin(), addresses.end(),
-                          entry.first.first) != addresses.end()) {
-                return Status::TooManyRequests(
-                    "Previous unregistration is incomplete; retain the buffer "
-                    "and retry unregisterLocalMemory before registering again"
+    CHECK_STATUS(retryFailedRegistrations(addresses));
+    const auto snapshot = metadata_->segmentManager().getLocal();
+    const auto& existing = std::get<MemorySegmentDesc>(snapshot->detail).buffers;
+    for (size_t i = 0; i < addresses.size(); ++i) {
+        for (const auto& buffer : existing) {
+            if (buffer.addr == addresses[i] && buffer.length == size_list[i] &&
+                (!buffer.registration_options ||
+                 !sameRegistrationOptions(*buffer.registration_options, options)))
+                return Status::InvalidArgument(
+                    "Duplicate registration requires identical memory options"
                     LOC_MARK);
-            }
         }
     }
-
-    // Build BufferDescs: warm-up → NUMA probe → fill location
-    std::vector<BufferDesc> desc_list;
-    desc_list.reserve(addr_list.size());
+    const auto registration_options =
+        std::make_shared<const MemoryOptions>(options);
+    std::vector<BufferDesc> descriptors;
+    descriptors.reserve(addr_list.size());
     for (size_t i = 0; i < addr_list.size(); ++i) {
         BufferDesc desc;
-        desc.addr = (uint64_t)addr_list[i];
+        desc.addr = addresses[i];
         desc.length = size_list[i];
         desc.source_epoch = metadata_->sourceEpoch();
-
-        // MR warm-up: pin pages via temp ibv_reg_mr, benefits both
-        // subsequent RDMA registration and NUMA probing
-        bool pages_pinned = false;
-        for (auto type : transports) {
-            if (transport_list_[type]->warmupMemory(addr_list[i],
-                                                    size_list[i])) {
-                pages_pinned = true;
-                break;
-            }
-        }
-
-        // NUMA probe: skip prefault if warm-up already pinned pages
-        auto entries = Platform::getLoader().getLocation(
-            addr_list[i], size_list[i], pages_pinned);
-        if (entries.size() == 1) {
-            desc.location = entries[0].location;
-        } else {
-            desc.location = entries[0].location;
-            desc.regions = coalesceRegions(entries);
-        }
         desc.ref_count = 1;
-        if (options.location != kWildcardLocation)
-            desc.location = options.location;
-        if (options.internal) desc.internal = options.internal;
-        desc_list.push_back(std::move(desc));
+        desc.registration_options = registration_options;
+        desc.transports.reserve(transports.size());
+        desc.location = options.location;
+        desc.internal = options.internal;
+        descriptors.push_back(std::move(desc));
     }
-
+    using Range = std::pair<uint64_t, uint64_t>;
+    std::map<Range, RetiredRegistration*> staged;
+    for (const auto& desc : descriptors) {
+        const Range key{desc.addr, desc.length};
+        const bool duplicate = std::any_of(
+            existing.begin(), existing.end(), [&](const BufferDesc& buffer) {
+                return buffer.addr == key.first && buffer.length == key.second;
+            });
+        if (duplicate || staged.count(key)) continue;
+        RetiredRegistration owner{desc, {}, true};
+        owner.pending.reserve(transports.size());
+        owner.registration_failed = true;
+        std::lock_guard<std::mutex> lock(retired_registration_mutex_);
+        staged.emplace(key, &retired_registrations_.emplace(key, std::move(owner))
+                                 .first->second);
+    }
     auto status = local_segment_tracker_->addInBatch(
-        desc_list, [&](std::vector<BufferDesc>& descs) -> Status {
-            for (auto type : transports) {
-                auto s = transport_list_[type]->addMemoryBuffer(descs, options);
-                if (!s.ok()) LOG(WARNING) << s.ToString();
+        descriptors, [&](std::vector<BufferDesc>& descs) -> Status {
+            std::vector<RetiredRegistration*> owners;
+            owners.reserve(descs.size());
+            std::vector<std::pair<size_t, TransportType>> incomplete;
+            incomplete.reserve(descs.size() * transports.size());
+            for (auto& desc : descs) {
+                auto* owner = staged.at({desc.addr, desc.length});
+                owners.push_back(owner);
+                // Reserve the retry owner before registration or its optional
+                // page-pinning warm-up can enter a provider.
+                bool pages_pinned = false;
+                for (auto type : transports) {
+                    if (transport_list_[type]->warmupMemory(
+                            (void*)desc.addr, desc.length)) {
+                        pages_pinned = true;
+                        break;
+                    }
+                }
+                const auto locations = Platform::getLoader().getLocation(
+                    (void*)desc.addr, desc.length, pages_pinned);
+                if (locations.empty())
+                    return Status::InvalidArgument("No memory location" LOC_MARK);
+                desc.location = options.location == kWildcardLocation
+                                    ? locations.front().location : options.location;
+                if (locations.size() > 1) desc.regions = coalesceRegions(locations);
+                owner->desc = desc;
             }
-            return Status::OK();
+            Status first_error;
+            const bool required = options.type != UNSPEC || transports.size() == 1;
+            for (auto type : transports) {
+                for (auto* owner : owners) owner->pending.push_back(type);
+                Status added;
+                try {
+                    added = transport_list_[type]->addMemoryBuffer(descs, options);
+                } catch (const std::exception& error) {
+                    added = Status::InternalError(error.what());
+                }
+                if (!added.ok() && first_error.ok()) first_error = added;
+                for (size_t i = 0; i < descs.size(); ++i) {
+                    auto& desc = descs[i];
+                    auto& owner = *owners[i];
+                    const auto original_addr = owner.desc.addr;
+                    const auto original_length = owner.desc.length;
+                    const bool range_changed = desc.addr != original_addr ||
+                                               desc.length != original_length;
+                    desc.addr = original_addr;
+                    desc.length = original_length;
+                    owner.desc = desc;
+                    if (range_changed)
+                        return Status::InvalidArgument(
+                            "Provider changed the registered range; retain "
+                            "the buffer until cleanup" LOC_MARK);
+                    const bool usable = std::find(desc.transports.begin(),
+                        desc.transports.end(), type) != desc.transports.end();
+                    if (!usable) {
+                        if (!added.ok() ||
+                            transport_list_[type]->tracksLocalBuffer(desc)) {
+                            incomplete.emplace_back(i, type);
+                        } else {
+                            owner.pending.erase(std::find(owner.pending.begin(),
+                                                          owner.pending.end(), type));
+                        }
+                    }
+                }
+                if (required && !added.ok()) return added;
+            }
+            if (std::any_of(descs.begin(), descs.end(),
+                            [](const BufferDesc& desc) {
+                                return desc.transports.empty();
+                            }))
+                return first_error.ok()
+                    ? Status::InvalidArgument("No usable transport for a range" LOC_MARK)
+                    : first_error;
+            Status cleanup_error;
+            for (const auto& [index, type] : incomplete) {
+                auto& owner = *owners[index];
+                auto descriptor = owner.desc;
+                const auto cleaned =
+                    transport_list_[type]->removeMemoryBuffer(descriptor);
+                if (!cleaned.ok()) {
+                    if (cleanup_error.ok()) cleanup_error = cleaned;
+                } else {
+                    owner.pending.erase(std::find(owner.pending.begin(),
+                                                  owner.pending.end(), type));
+                }
+            }
+            return cleanup_error;
         });
-    if (!status.ok()) return status;
-    // Synchronize local segment to metadata server so remote peers can see the
-    // new buffers
-    return metadata_->segmentManager().synchronizeLocal();
+    if (status.ok()) {
+        for (const auto& [key, owner] : staged) owner->withdrawn = false;
+        status = metadata_->segmentManager().synchronizeLocal();
+        if (status.ok()) {
+            std::lock_guard<std::mutex> lock(retired_registration_mutex_);
+            for (const auto& [key, owner] : staged) retired_registrations_.erase(key);
+            return status;
+        }
+        for (size_t i = 0; i < addresses.size(); ++i) {
+            auto rollback = local_segment_tracker_->remove(
+                addresses[i], size_list[i], [&](BufferDesc& desc) {
+                    auto* owner = staged.at({desc.addr, desc.length});
+                    owner->withdrawn = true;
+                    owner->withdrawal_revision =
+                        metadata_->segmentManager().localRevision();
+                    return Status::OK();
+                });
+            if (!rollback.ok()) LOG(WARNING) << rollback.ToString();
+        }
+    }
+    // A failed call grants no reference. The tracker has rolled back only this
+    // attempt's duplicate increments; new physical owners are still here.
+    Status cleanup_error;
+    for (const auto& [key, owner] : staged) {
+        if (!owner->withdrawn) {
+            cleanup_error = Status::InternalError(
+                "Failed registration withdrawal is incomplete" LOC_MARK);
+            continue;
+        }
+        const auto cleanup = cleanRegistration(*owner);
+        if (!cleanup.ok() && cleanup_error.ok()) cleanup_error = cleanup;
+    }
+    const auto sync = metadata_->segmentManager().synchronizeLocal();
+    const auto published = metadata_->segmentManager().publishedRevision();
+    bool retained = false;
+    {
+        std::lock_guard<std::mutex> lock(retired_registration_mutex_);
+        for (const auto& [key, owner] : staged) {
+            if (owner->withdrawn && owner->pending.empty() &&
+                published >= owner->withdrawal_revision)
+                retired_registrations_.erase(key);
+            else
+                retained = true;
+        }
+    }
+    if (retained || !cleanup_error.ok() || !sync.ok())
+        return Status::InternalError(
+            "Registration failed; retain the buffer and retry registration "
+            "or unregister to finish cleanup: " + status.ToString());
+    return status;
 }
 
 // WARNING: before exiting TE, make sure that all local memory are
@@ -1010,6 +1142,54 @@ void TransferEngineImpl::releasePublishedPrefixes(
     }
 }
 
+Status TransferEngineImpl::cleanRegistration(RetiredRegistration& retired) {
+    Status first_error;
+    for (auto it = retired.pending.begin(); it != retired.pending.end();) {
+        BufferDesc descriptor = retired.desc;
+        const auto status = transport_list_[*it]->removeMemoryBuffer(descriptor);
+        if (!status.ok()) {
+            if (first_error.ok()) first_error = status;
+            ++it;
+        } else {
+            it = retired.pending.erase(it);
+        }
+    }
+    return first_error;
+}
+
+Status TransferEngineImpl::retryFailedRegistrations(
+    const std::vector<uint64_t>& addresses) {
+    using Range = std::pair<uint64_t, uint64_t>;
+    std::vector<std::pair<Range, RetiredRegistration*>> retry;
+    {
+        std::lock_guard<std::mutex> lock(retired_registration_mutex_);
+        for (auto& [key, owner] : retired_registrations_) {
+            if (std::find(addresses.begin(), addresses.end(), key.first) ==
+                addresses.end()) continue;
+            if (!owner.registration_failed)
+                return Status::TooManyRequests(
+                    "Previous unregistration is incomplete; retain the buffer "
+                    "and retry unregisterLocalMemory before registering again"
+                    LOC_MARK);
+            retry.emplace_back(key, &owner);
+        }
+    }
+    for (const auto& [key, owner] : retry) {
+        if (!owner->withdrawn)
+            return Status::InternalError("Registration is still published" LOC_MARK);
+        CHECK_STATUS(cleanRegistration(*owner));
+    }
+    if (!retry.empty()) CHECK_STATUS(metadata_->segmentManager().synchronizeLocal());
+    const auto published = metadata_->segmentManager().publishedRevision();
+    std::lock_guard<std::mutex> lock(retired_registration_mutex_);
+    for (const auto& [key, owner] : retry) {
+        if (published < owner->withdrawal_revision)
+            return Status::TooManyRequests("Registration withdrawal is unpublished" LOC_MARK);
+        retired_registrations_.erase(key);
+    }
+    return Status::OK();
+}
+
 Status TransferEngineImpl::unregisterLocalMemoryLocked(void* addr, size_t size,
                                                      bool synchronize) {
     const auto base = reinterpret_cast<uint64_t>(addr);
@@ -1077,17 +1257,7 @@ Status TransferEngineImpl::unregisterLocalMemoryLocked(void* addr, size_t size,
                 LOC_MARK);
         }
     }
-    Status first_error;
-    for (auto it = retired->pending.begin(); it != retired->pending.end();) {
-        BufferDesc transport_desc = retired->desc;
-        auto status = transport_list_[*it]->removeMemoryBuffer(transport_desc);
-        if (!status.ok()) {
-            if (first_error.ok()) first_error = status;
-            ++it;
-        } else {
-            it = retired->pending.erase(it);
-        }
-    }
+    const auto first_error = cleanRegistration(*retired);
     if (!synchronize && first_error.ok()) {
         std::lock_guard<std::mutex> lock(retired_registration_mutex_);
         retired->completed_prefix = true;

@@ -503,7 +503,10 @@ class TransferEngineImpl {
         bool withdrawn{false};
         uint64_t withdrawal_revision{0};
         bool completed_prefix{false};
+        bool registration_failed{false};
     };
+    Status cleanRegistration(RetiredRegistration& retired);
+    Status retryFailedRegistrations(const std::vector<uint64_t>& addresses);
     void releasePublishedPrefixes(const std::vector<void*>& addresses,
                                   size_t count);
     Status unregisterLocalMemoryLocked(void* addr, size_t size,

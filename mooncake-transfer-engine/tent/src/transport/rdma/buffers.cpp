@@ -100,90 +100,114 @@ Status LocalBufferManager::addBuffer(BufferDesc& desc,
 Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
                                              const MemoryOptions& options,
                                              bool force_sequential) {
-    AddressRange range((void*)desc.addr, desc.length);
+    const AddressRange range((void*)desc.addr, desc.length);
+    const auto contexts = context_list_;
     BufferEntryForRdma staging;
-    assert(desc.rkey.empty());
-    size_t context_count = 0;
-    for (auto* context : context_list_) {
-        if (context) ++context_count;
+    staging.options = options;
+    staging.mem_reg_map.reserve(contexts.size());
+    for (auto* context : contexts) {
+        if (context) staging.mem_reg_map.emplace(context, nullptr);
+    }
+    const auto context_count = staging.mem_reg_map.size();
+    std::vector<RdmaContext::MemReg> registrations(contexts.size(), nullptr);
+    std::vector<std::future<void>> tasks;
+    tasks.reserve(context_count);
+    desc.lkey.assign(contexts.size(), 0);
+    desc.rkey.assign(contexts.size(), 0);
+    desc.transports.reserve(desc.transports.size() + 1);
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (!buffer_list_.emplace(range, std::move(staging)).second)
+            return Status::RdmaError("RDMA buffer is already owned" LOC_MARK);
     }
 
-    std::vector<RdmaContext::MemReg> mem_reg_list(context_list_.size(),
-                                                  nullptr);
-    bool use_parallel_reg = !force_sequential && context_count > 1;
-    if (use_parallel_reg) {
-        std::vector<std::future<void>> tasks;
-        tasks.reserve(context_count);
-        void* addr = (void*)desc.addr;
-        size_t length = desc.length;
-        for (size_t id = 0; id < context_list_.size(); ++id) {
-            auto* context = context_list_[id];
-            if (!context) continue;
-            // Calculate access flags per context (for relaxed ordering support)
-            int access = getAccessFlags(options.perm,
-                                        context->isRelaxedOrderingEnabled());
-            tasks.emplace_back(std::async(
-                std::launch::async,
-                [context, &mem_reg_list, id, addr, length, access]() {
-                    mem_reg_list[id] =
-                        context->registerMemReg(addr, length, access);
-                }));
+    Status failure;
+    const auto register_context = [&](size_t id) {
+        auto* context = contexts[id];
+        const int access = getAccessFlags(
+            options.perm, context->isRelaxedOrderingEnabled());
+        registrations[id] = context->registerMemReg(
+            (void*)desc.addr, desc.length, access);
+    };
+    try {
+        for (size_t id = 0; id < contexts.size(); ++id) {
+            if (!contexts[id]) continue;
+            if (!force_sequential && context_count > 1) {
+                tasks.emplace_back(std::async(std::launch::async,
+                                              register_context, id));
+            } else {
+                register_context(id);
+            }
         }
-        for (auto& task : tasks) task.get();
-    } else {
-        for (size_t id = 0; id < context_list_.size(); ++id) {
-            auto* context = context_list_[id];
-            if (!context) continue;
-            // Calculate access flags per context (for relaxed ordering support)
-            int access = getAccessFlags(options.perm,
-                                        context->isRelaxedOrderingEnabled());
-            mem_reg_list[id] =
-                context->registerMemReg((void*)desc.addr, desc.length, access);
+    } catch (const std::exception& error) {
+        failure = Status::RdmaError(error.what());
+    }
+    for (auto& task : tasks) {
+        try {
+            task.get();
+        } catch (const std::exception& error) {
+            if (failure.ok()) failure = Status::RdmaError(error.what());
         }
     }
-    // NicID-keyed like context_list_, not compacted: slice dispatch subscripts
-    // these with a dev_id from the topology, so gaps must stay in place.
-    // Devices with no context contribute a zero key that is never selected.
-    desc.lkey.assign(context_list_.size(), 0);
-    desc.rkey.assign(context_list_.size(), 0);
-    for (size_t id = 0; id < context_list_.size(); ++id) {
-        if (!context_list_[id]) continue;
-        if (!mem_reg_list[id]) {
-            return Status::RdmaError(
-                "Unable to register buffer of local memory segment" LOC_MARK);
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        auto& retained = buffer_list_.at(range).mem_reg_map;
+        for (size_t id = 0; id < contexts.size(); ++id) {
+            auto* context = contexts[id];
+            if (!context) continue;
+            if (!registrations[id]) {
+                retained.erase(context);
+                if (failure.ok())
+                    failure = Status::RdmaError(
+                        "Unable to register buffer of local memory segment"
+                        LOC_MARK);
+                continue;
+            }
+            retained.at(context) = registrations[id];
+            const auto keys = context->queryMemRegKey(registrations[id]);
+            desc.lkey[id] = keys.first;
+            desc.rkey[id] = keys.second;
         }
-        staging.mem_reg_map[context_list_[id]] = mem_reg_list[id];
-        auto keys = context_list_[id]->queryMemRegKey(mem_reg_list[id]);
-        desc.lkey[id] = keys.first;
-        desc.rkey[id] = keys.second;
+        if (!context_count && failure.ok())
+            failure = Status::RdmaError("No RDMA context for buffer" LOC_MARK);
     }
-    staging.options = options;
-    RWSpinlock::WriteGuard guard(lock_);
-    buffer_list_[range] = staging;
+    if (!failure.ok()) return failure;
+    desc.transports.push_back(TransportType::RDMA);
     return Status::OK();
 }
 
 Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
                                      const MemoryOptions& options) {
     if (desc_list.empty()) return Status::OK();
-    if (desc_list.size() == 1) {
+    if (desc_list.size() == 1)
         return addBufferInternal(desc_list.front(), options, false);
-    }
-
     std::vector<std::future<Status>> tasks;
     tasks.reserve(desc_list.size());
-    for (auto& desc : desc_list) {
-        auto* desc_ptr = &desc;
-        tasks.emplace_back(
-            std::async(std::launch::async, [this, desc_ptr, options]() {
-                return addBufferInternal(*desc_ptr, options, true);
-            }));
+    Status failure;
+    try {
+        for (auto& desc : desc_list) {
+            tasks.emplace_back(std::async(
+                std::launch::async, [this, &desc, options]() {
+                    return addBufferInternal(desc, options, true);
+                }));
+        }
+    } catch (const std::exception& error) {
+        failure = Status::RdmaError(error.what());
     }
     for (auto& task : tasks) {
-        auto status = task.get();
-        if (!status.ok()) return status;
+        try {
+            auto status = task.get();
+            if (!status.ok() && failure.ok()) failure = status;
+        } catch (const std::exception& error) {
+            if (failure.ok()) failure = Status::RdmaError(error.what());
+        }
     }
-    return Status::OK();
+    return failure;
+}
+
+bool LocalBufferManager::tracksBuffer(const BufferDesc& desc) {
+    RWSpinlock::ReadGuard guard(lock_);
+    return buffer_list_.count(AddressRange((void*)desc.addr, desc.length)) != 0;
 }
 
 Status LocalBufferManager::removeBuffer(BufferDesc& desc) {

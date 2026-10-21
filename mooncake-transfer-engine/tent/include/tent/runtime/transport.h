@@ -146,6 +146,8 @@ class Transport {
             "removeMemoryBuffer not implemented" LOC_MARK);
     }
 
+    virtual bool tracksLocalBuffer(const BufferDesc& desc) { return false; }
+
     virtual bool supportNotification() const { return false; }
 
     virtual Status sendNotification(SegmentID target_id,

@@ -612,22 +612,20 @@ bool RdmaTransport::warmupMemory(void* addr, size_t length) {
 
 Status RdmaTransport::addMemoryBuffer(BufferDesc& desc,
                                       const MemoryOptions& options) {
-    CHECK_STATUS(local_buffer_manager_.addBuffer(desc, options));
-    desc.transports.push_back(TransportType::RDMA);
-    return Status::OK();
+    return local_buffer_manager_.addBuffer(desc, options);
 }
 
 Status RdmaTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
                                       const MemoryOptions& options) {
-    CHECK_STATUS(local_buffer_manager_.addBuffer(desc_list, options));
-    for (auto& desc : desc_list) {
-        desc.transports.push_back(TransportType::RDMA);
-    }
-    return Status::OK();
+    return local_buffer_manager_.addBuffer(desc_list, options);
 }
 
 Status RdmaTransport::removeMemoryBuffer(BufferDesc& desc) {
     return local_buffer_manager_.removeBuffer(desc);
+}
+
+bool RdmaTransport::tracksLocalBuffer(const BufferDesc& desc) {
+    return local_buffer_manager_.tracksBuffer(desc);
 }
 
 Status RdmaTransport::setupLocalSegment() {
