@@ -425,6 +425,8 @@ class TransferEngineImpl {
                                bool poll_until_terminal = false);
     int closeSource(uint64_t timeout_ms, char* epoch, uint64_t* active);
     bool supportsSourceDrain();
+    int sourceEpoch(char* epoch, size_t capacity);
+    Status validateRemoteEpoch(SegmentID segment, const std::string& expected);
 
    private:
     friend class ProgressWorker;
