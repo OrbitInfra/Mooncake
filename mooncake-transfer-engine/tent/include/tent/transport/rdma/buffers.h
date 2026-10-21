@@ -97,6 +97,8 @@ class LocalBufferManager {
 
     Status removeBuffer(BufferDesc &desc);
 
+    bool tracksBuffer(const BufferDesc &desc);
+
     Status addDevice(RdmaContext *context);
 
     Status removeDevice(RdmaContext *context, bool do_unreg = true);
@@ -113,7 +115,7 @@ class LocalBufferManager {
     };
 
    private:
-    RWSpinlock lock_;
+    mutable RWSpinlock lock_;
     std::vector<RdmaContext *> context_list_;
     std::map<AddressRange, BufferEntryForRdma> buffer_list_;
     std::shared_ptr<Topology> topology_;

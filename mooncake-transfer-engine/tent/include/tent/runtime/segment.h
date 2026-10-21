@@ -71,6 +71,7 @@ struct BufferDesc {
     std::unordered_map<TransportType, std::string> transport_attrs;
     // mutable elements
     int ref_count{0};
+    std::shared_ptr<const MemoryOptions> registration_options;
     std::string source_epoch;
 
     // backward compatilble
