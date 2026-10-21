@@ -251,8 +251,15 @@ Status SegmentManager::synchronizeLocal() {
         // newer snapshot in the registry, hiding a completed registration
         // from peers until the next synchronizeLocal call.
         std::lock_guard<std::mutex> g(local_sync_mu_);
-        auto snapshot = getLocal();
+        SegmentDescRef snapshot;
+        uint64_t revision;
+        {
+            std::lock_guard<std::mutex> update(local_update_mu_);
+            snapshot = getLocal();
+            revision = local_desc_version_.load(std::memory_order_acquire);
+        }
         CHECK_STATUS(registry_->putSegmentDesc(snapshot));
+        published_local_version_.store(revision, std::memory_order_release);
     }
 
     std::vector<std::string> subscribers_snapshot;

@@ -194,6 +194,14 @@ class SegmentManager {
 
     Status synchronizeLocal();
 
+    uint64_t localRevision() const {
+        return local_desc_version_.load(std::memory_order_acquire);
+    }
+
+    uint64_t publishedRevision() const {
+        return published_local_version_.load(std::memory_order_acquire);
+    }
+
     Status deleteLocal();
 
     // Registers a peer's RPC address to receive proactive cache invalidation
@@ -237,6 +245,7 @@ class SegmentManager {
     // getLocal() and tags local_json_cache_ so that a slow JSON dump of an
     // old snapshot can never overwrite the cache entry of a newer one.
     std::atomic<uint64_t> local_desc_version_{0};
+    std::atomic<uint64_t> published_local_version_{0};
     // Process-unique id for the thread-local cache key in getLocal().
     const uint64_t manager_id_;
 

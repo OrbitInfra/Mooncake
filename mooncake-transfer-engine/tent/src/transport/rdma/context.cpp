@@ -620,16 +620,16 @@ int RdmaContext::unregisterMemReg(MemReg id) {
         return -1;
     }
     auto entry = (ibv_mr*)id;
-    mr_set_mutex_.lock();
-    mr_set_.erase(entry);
-    mr_set_mutex_.unlock();
-
+    void* region_addr = entry->addr;
+    size_t region_length = entry->length;
+    std::lock_guard<std::mutex> lock(mr_set_mutex_);
     if (verbs_.ibv_dereg_mr(entry)) {
-        const void* end = static_cast<const char*>(entry->addr) + entry->length;
-        LOG(ERROR) << "Failed to unregister memory from " << entry->addr
+        const void* end = static_cast<const char*>(region_addr) + region_length;
+        LOG(ERROR) << "Failed to unregister memory from " << region_addr
                    << " to " << end << " in RDMA device " << device_name_;
+        return -1;
     }
-
+    mr_set_.erase(entry);
     return 0;
 }
 

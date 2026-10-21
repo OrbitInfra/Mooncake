@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -31,6 +32,7 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/runtime/admission_queue.h"
+#include "tent/runtime/registration_guard.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
 
@@ -495,6 +497,21 @@ class TransferEngineImpl {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
         transport_list_;
     std::unique_ptr<SegmentTracker> local_segment_tracker_;
+    struct RetiredRegistration {
+        BufferDesc desc;
+        std::vector<TransportType> pending;
+        bool withdrawn{false};
+        uint64_t withdrawal_revision{0};
+        bool completed_prefix{false};
+    };
+    void releasePublishedPrefixes(const std::vector<void*>& addresses,
+                                  size_t count);
+    Status unregisterLocalMemoryLocked(void* addr, size_t size,
+                                      bool synchronize = true);
+    RegistrationCoordinator registration_coordinator_;
+    std::mutex retired_registration_mutex_;
+    std::map<std::pair<uint64_t, uint64_t>, RetiredRegistration>
+        retired_registrations_;
 
     BatchSet batch_set_;
 
