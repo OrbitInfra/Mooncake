@@ -131,6 +131,12 @@ void tent_set_config(const char* key, const char* value);
 tent_engine_t tent_create_engine();
 
 void tent_destroy_engine(tent_engine_t engine);
+// Irreversibly close source admission, then await admitted CPU/TCP handlers.
+// 0: drained; 1: still owned; 2: unsupported physical path; -1: error.
+// epoch points to 33 bytes; active is observed after the bounded wait.
+// This does not drain requester batches or authorize individual ticket reuse.
+int tent_close_source(tent_engine_t engine, uint64_t timeout_ms,
+                      char* epoch, uint64_t* active);
 
 int tent_segment_name(tent_engine_t engine, char* buf, size_t buf_len);
 

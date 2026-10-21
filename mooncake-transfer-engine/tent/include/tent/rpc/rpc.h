@@ -16,6 +16,8 @@
 #define TENT_YLT_RPC_H
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <functional>
@@ -84,6 +86,7 @@ class CoroRpcAgent {
     Status start(uint16_t &port, bool ipv6 = false, size_t threads = 1);
 
     Status stop();
+    uint64_t closeDispatch(std::chrono::milliseconds timeout);
 
     Status call(const std::string &server_addr, int func_id,
                 const std::string_view &request, std::string &response);
@@ -106,6 +109,20 @@ class CoroRpcAgent {
     std::shared_ptr<ClientPool> getOrCreatePool(const std::string &server_addr);
 
    private:
+    class DispatchGuard {
+       public:
+        explicit DispatchGuard(CoroRpcAgent& owner) : owner_(owner) {}
+        ~DispatchGuard() { owner_.finishDispatch(); }
+        DispatchGuard(const DispatchGuard&) = delete;
+        DispatchGuard& operator=(const DispatchGuard&) = delete;
+       private:
+        CoroRpcAgent& owner_;
+    };
+    void finishDispatch();
+    std::mutex dispatch_mutex_;
+    std::condition_variable dispatch_cv_;
+    uint64_t dispatch_active_{0};
+    bool dispatch_closed_{true};
     struct Handler {
         Function func;
         bool offload = false;

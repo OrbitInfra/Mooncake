@@ -234,10 +234,10 @@ void TcpTransport::startTransfer(TcpTask *task) {
 }
 
 Status TcpTransport::doTransferWithRetry(TcpTask *task) {
-    std::string rpc_server_addr;
+    std::string rpc_server_addr, source_epoch;
     auto status =
         findRemoteSegment(task->request.target_offset, task->request.length,
-                          task->request.target_id, rpc_server_addr);
+                          task->request.target_id, rpc_server_addr, source_epoch);
     if (!status.ok()) return status;
 
     Status last_error;
@@ -264,11 +264,11 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         if (task->request.opcode == Request::WRITE) {
             status = ControlClient::sendData(
                 rpc_server_addr, task->request.target_offset,
-                task->request.source, task->request.length);
+                task->request.source, task->request.length, source_epoch);
         } else {
             status = ControlClient::recvData(
                 rpc_server_addr, task->request.target_offset,
-                task->request.source, task->request.length);
+                task->request.source, task->request.length, source_epoch);
         }
 
         if (status.ok()) return Status::OK();
@@ -284,10 +284,13 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         // Peer may have restarted with a new address; re-resolve before retry
         if (status.IsRpcServiceError()) {
             rpc_server_addr.clear();
+            std::string refreshed_epoch;
             auto resolve = findRemoteSegment(
                 task->request.target_offset, task->request.length,
-                task->request.target_id, rpc_server_addr);
+                task->request.target_id, rpc_server_addr, refreshed_epoch);
             if (!resolve.ok()) return resolve;
+            if (refreshed_epoch != source_epoch)
+                return Status::RpcServiceError("Source epoch changed during retry");
         }
     }
 
@@ -296,7 +299,8 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
 
 Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
                                        uint64_t target_id,
-                                       std::string &rpc_server_addr) {
+                                       std::string &rpc_server_addr,
+                                       std::string &source_epoch) {
     return metadata_->segmentManager().withCachedSegment(
         target_id, [&](SegmentDesc *segment) {
             auto buffer = segment->findBuffer(dest_addr, length);
@@ -309,6 +313,7 @@ Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
                 return Status::NeedsRefreshCache(
                     "Empty RPC server addr" LOC_MARK);
             }
+            source_epoch = buffer->source_epoch;
             return Status::OK();
         });
 }

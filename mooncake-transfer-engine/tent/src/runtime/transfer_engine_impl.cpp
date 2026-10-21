@@ -500,10 +500,13 @@ Status TransferEngineImpl::construct() {
                   << " started successfully";
     }
 
+    metadata_->markSourceReady(supportsSourceDrain());
     return Status::OK();
 }
 
 Status TransferEngineImpl::deconstruct() {
+    // Join RPC callbacks before tearing down the fields their handlers use.
+    if (metadata_) metadata_->stop();
     // Metrics cleanup is handled automatically by TentMetrics destructor
 
     // Stop the progress worker first so it cannot race with batch teardown
@@ -795,6 +798,8 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             "No available transport for registerLocalMemory" LOC_MARK);
     }
 
+    if (metadata_->sourceClosed())
+        return Status::InvalidArgument("Source admission permanently closed");
     // Build BufferDescs: warm-up → NUMA probe → fill location
     std::vector<BufferDesc> desc_list;
     desc_list.reserve(addr_list.size());
@@ -802,6 +807,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         BufferDesc desc;
         desc.addr = (uint64_t)addr_list[i];
         desc.length = size_list[i];
+        desc.source_epoch = metadata_->sourceEpoch();
 
         // MR warm-up: pin pages via temp ibv_reg_mr, benefits both
         // subsequent RDMA registration and NUMA probing
@@ -846,6 +852,26 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
 
 // WARNING: before exiting TE, make sure that all local memory are
 // unregistered, otherwise the CUDA may halt!
+int TransferEngineImpl::closeSource(uint64_t timeout_ms, char* epoch, uint64_t* active) {
+    if (!available_ || !metadata_ || !epoch || !active || timeout_ms > 5000 ||
+        metadata_->sourceEpoch().size() != 32) return -1;
+    memcpy(epoch, metadata_->sourceEpoch().c_str(), 33);
+    *active = metadata_->closeSource(timeout_ms);
+    if (!supportsSourceDrain()) return 2;
+    return *active == 0 ? 0 : 1;
+}
+
+bool TransferEngineImpl::supportsSourceDrain() {
+#ifdef USE_CUDA
+    return false;
+#else
+    if (Platform::getLoader().type() != "cpu") return false;
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type)
+        if (type != TCP && transport_list_[type]) return false;
+    return true;
+#endif
+}
+
 Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
     bool removed = false;
     auto status = local_segment_tracker_->remove(

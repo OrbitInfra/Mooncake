@@ -60,6 +60,7 @@ struct BootstrapDesc {
 struct XferDataDesc {
     uint64_t peer_mem_addr;
     size_t length;
+    char source_epoch[33];
 };
 
 using OnReceiveBootstrap =
@@ -83,11 +84,11 @@ class ControlClient {
 
     static Status sendData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
-                           size_t length);
+                           size_t length, const std::string& source_epoch);
 
     static Status recvData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
-                           size_t length);
+                           size_t length, const std::string& source_epoch);
 
     static Status notify(const std::string& server_addr,
                          const Notification& message);
@@ -139,6 +140,14 @@ class ControlService {
     void setNotifyCallback(const OnNotify& callback);
 
     Status start(uint16_t& port, bool ipv6_ = false, size_t threads = 1);
+    const std::string& sourceEpoch() const { return source_epoch_; }
+    bool sourceClosed();
+    void markSourceReady(bool supported);
+    bool beginAuxiliary();
+    void stop();
+    uint64_t closeSource(uint64_t timeout_ms);
+    bool beginSource(const char* epoch);
+    void finishSource();
 
    private:
     void onGetSegmentDesc(const std::string_view& request,
@@ -174,6 +183,13 @@ class ControlService {
     void finishNotifyCallback();
 
    private:
+    std::mutex source_mutex_;
+    std::condition_variable source_cv_;
+    bool source_closed_{false};
+    bool source_ready_{false};
+    bool source_drain_supported_{false};
+    uint64_t source_active_{0};
+    std::string source_epoch_;
     std::unique_ptr<SegmentManager> manager_;
     std::shared_ptr<CoroRpcAgent> rpc_server_;
 

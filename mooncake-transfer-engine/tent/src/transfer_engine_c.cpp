@@ -59,6 +59,16 @@ void tent_destroy_engine(tent_engine_t engine) {
     }
 }
 
+int tent_close_source(tent_engine_t engine, uint64_t timeout_ms,
+                      char* epoch, uint64_t* active) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(epoch);
+    CHECK_POINTER(active);
+    try {
+        return CAST(engine)->closeSource(timeout_ms, epoch, active);
+    } catch (...) { return -1; }
+}
+
 int tent_segment_name(tent_engine_t engine, char* buf, size_t buf_len) {
     CHECK_POINTER(engine);
     CHECK_POINTER(buf);
