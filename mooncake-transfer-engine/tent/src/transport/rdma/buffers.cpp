@@ -216,14 +216,24 @@ Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
 Status LocalBufferManager::removeBuffer(BufferDesc& desc) {
     RWSpinlock::WriteGuard guard(lock_);
     AddressRange range((void*)desc.addr, desc.length);
+    auto found = buffer_list_.find(range);
+    if (found == buffer_list_.end()) return Status::OK();
+    bool failed = false;
+    auto& registrations = found->second.mem_reg_map;
+    for (auto it = registrations.begin(); it != registrations.end();) {
+        if (it->first->unregisterMemReg(it->second)) {
+            failed = true;
+            ++it;
+        } else {
+            it = registrations.erase(it);
+        }
+    }
+    if (failed) {
+        return Status::RdmaError("Unable to unregister buffer" LOC_MARK);
+    }
     desc.lkey.clear();
     desc.rkey.clear();
-    auto iter = buffer_list_.find(range);
-    if (iter == buffer_list_.end()) return Status::OK();
-    for (auto& elem : iter->second.mem_reg_map) {
-        elem.first->unregisterMemReg(elem.second);
-    }
-    buffer_list_.erase(iter);
+    buffer_list_.erase(found);
     return Status::OK();
 }
 
