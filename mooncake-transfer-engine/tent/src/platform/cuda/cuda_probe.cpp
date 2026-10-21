@@ -254,6 +254,14 @@ static void insertFallbackMemEntry(int nic_list_count,
 
 Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
                            std::vector<Topology::MemEntry>& mem_list) {
+    if (!ensureCudaDriverInit()) {
+        return Status::CudaError("CUDA driver initialization failed before transport admission");
+    }
+    int count = 0;
+    CHECK_CUDA(cudaGetDeviceCount(&count));
+    if (count <= 0) {
+        return Status::DeviceNotFound("CUDA bundle has no usable device");
+    }
     auto new_nic_list = listInfiniBandDevices();
     filterInfiniBandDevices(new_nic_list, conf);
     for (auto& entry : new_nic_list) nic_list.push_back(entry);
@@ -298,9 +306,10 @@ bool cudaAbiMatches() {
 }  // namespace
 
 MemoryType CudaPlatform::getMemoryType(void* addr) {
-    if (!cudaDevicePresent()) return MTYPE_CPU;
     if (!cudaAbiMatches()) return MTYPE_UNKNOWN;
-    return getCudaDeviceForPtr(addr) >= 0 ? MTYPE_CUDA : MTYPE_CPU;
+    int device = -1;
+    if (!cudaPointerDevice(addr, device).ok()) return MTYPE_UNKNOWN;
+    return device >= 0 ? MTYPE_CUDA : MTYPE_CPU;
 }
 
 int CudaPlatform::getPointerDeviceId(void* addr) {
@@ -340,7 +349,11 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
     }
     if (cudaDevicePresent()) {
         // Unregistered pointers fall through to the NUMA probe below.
-        int cuda_dev = getCudaDeviceForPtr(start);
+        int cuda_dev = -1;
+        if (!cudaPointerDevice(start, cuda_dev).ok()) {
+            entries.push_back({(uint64_t)start, len, kWildcardLocation});
+            return entries;
+        }
         if (cuda_dev >= 0) {
             entries.push_back(
                 {(uint64_t)start, len, genCudaNodeName(cuda_dev)});

@@ -24,6 +24,8 @@
 #include <numa.h>
 #include <vector>
 #include <cstring>
+#include <poll.h>
+#include <unistd.h>
 
 namespace mooncake {
 namespace tent {
@@ -75,7 +77,9 @@ Status CudaPlatform::allocate(void** pptr, size_t size,
 }
 
 Status CudaPlatform::free(void* ptr, size_t size) {
-    if (getCudaDeviceForPtr(ptr) >= 0) {
+    int device = -1;
+    CHECK_STATUS(cudaPointerDevice(ptr, device));
+    if (device >= 0) {
         CHECK_CUDA(cudaFree(ptr));
     } else {
         numa_free(ptr, size);
@@ -109,16 +113,40 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     // may live on cuda:R; taking the stream from the buffer's device routes the
     // copy correctly without mutating the calling thread's current device.
     // Host-only copies keep the current device.
-    int device_id = getPointerDeviceId(dst);
-    if (device_id == CUDAStreamPool::kCurrentDevice) {
-        device_id = getPointerDeviceId(src);
-    }
-    if (device_id == CUDAStreamPool::kCurrentDevice) {
-        // Host-to-host: plain memcpy. The stream pool would create a primary
-        // context on the thread's default device (GPU 0).
+    int destination_device = -1, source_device = -1;
+    CHECK_STATUS(cudaPointerDevice(dst, destination_device));
+    CHECK_STATUS(cudaPointerDevice(src, source_device));
+    const int device_id = destination_device >= 0 ? destination_device : source_device;
+    if (device_id < 0) {
         ::memcpy(dst, src, length);
         return Status::OK();
     }
+
+    constexpr size_t max_copy_calls = 64;
+    constexpr size_t max_copy_bytes = size_t{1} << 30;
+    if (length > max_copy_bytes) return Status::TooManyRequests("CUDA copy byte admission");
+    const size_t calls = copy_calls_.fetch_add(1, std::memory_order_relaxed);
+    if (calls >= max_copy_calls) {
+        copy_calls_.fetch_sub(1, std::memory_order_relaxed);
+        return Status::TooManyRequests("CUDA copy call admission");
+    }
+    size_t bytes = copy_bytes_.load(std::memory_order_relaxed);
+    while (true) {
+        if (bytes > max_copy_bytes - length) {
+            copy_calls_.fetch_sub(1, std::memory_order_relaxed);
+            return Status::TooManyRequests("CUDA copy byte admission");
+        }
+        if (copy_bytes_.compare_exchange_weak(bytes, bytes + length, std::memory_order_relaxed)) break;
+    }
+    struct CopyAdmission {
+        std::atomic<size_t>& calls;
+        std::atomic<size_t>& bytes;
+        size_t length;
+        ~CopyAdmission() {
+            bytes.fetch_sub(length, std::memory_order_relaxed);
+            calls.fetch_sub(1, std::memory_order_relaxed);
+        }
+    } admission{copy_calls_, copy_bytes_, length};
 
     // cudaMemcpyAsync() validates the stream against the current device's
     // context, so the copy has to run with the buffer's device pinned. A
@@ -127,17 +155,15 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     // thread that had no current context must not be left holding the one
     // this copy creates. Save the exact identity through the driver API.
     CUcontext caller_ctx = nullptr;
-    if (ensureCudaDriverInit() &&
-        cuCtxGetCurrent(&caller_ctx) != CUDA_SUCCESS) {
+    if (cuCtxGetCurrent(&caller_ctx) != CUDA_SUCCESS) {
         return Status::InternalError(std::string("cuCtxGetCurrent failed") +
                                      LOC_MARK);
     }
     // Bare cudaGetDevice() can implicitly create GPU 0 when this thread has
     // no current context; only query the runtime binding when one exists.
     int caller_device = -1;
-    if (caller_ctx != nullptr && cudaGetDevice(&caller_device) != cudaSuccess) {
-        caller_device = -1;
-        (void)cudaGetLastError();
+    if (caller_ctx != nullptr) {
+        CHECK_CUDA(cudaGetDevice(&caller_device));
     }
 
     Status status;
@@ -153,18 +179,14 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
         if (status.ok()) {
             err = cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault,
                                   stream.get());
+            if (err == cudaSuccess) err = cudaStreamSynchronize(stream.get());
             if (err != cudaSuccess) {
-                status =
-                    Status::InternalError(std::string("cudaMemcpyAsync: ") +
-                                          cudaGetErrorString(err) + LOC_MARK);
-            }
-        }
-        if (status.ok()) {
-            err = cudaStreamSynchronize(stream.get());
-            if (err != cudaSuccess) {
-                status = Status::InternalError(
-                    std::string("cudaStreamSynchronize: ") +
-                    cudaGetErrorString(err) + LOC_MARK);
+                // CUDA errors may report preceding async work. Keep the stream,
+                // admitted bytes and the caller's RPC scratch alive.
+                constexpr char message[] =
+                    "TENT: CUDA copy termination unproven; retaining stream, buffers and admission\n";
+                (void)::write(STDERR_FILENO, message, sizeof(message) - 1);
+                while (true) (void)::poll(nullptr, 0, -1);
             }
         }
     }
@@ -173,20 +195,16 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     // brings the runtime binding back (and may swap in that device's primary
     // context), then cuCtxSetCurrent() restores the exact context identity: a
     // custom CUcontext, or none at all for a caller that started bare.
+    bool restore_failed = false;
     if (caller_device != -1 && caller_device != device_id) {
-        err = cudaSetDevice(caller_device);
-        if (status.ok() && err != cudaSuccess) {
-            status =
-                Status::InternalError(std::string("cudaSetDevice(restore): ") +
-                                      cudaGetErrorString(err) + LOC_MARK);
-        }
+        restore_failed = cudaSetDevice(caller_device) != cudaSuccess;
     }
     const CUresult restore_rc = cuCtxSetCurrent(caller_ctx);
-    if (status.ok() && restore_rc != CUDA_SUCCESS) {
-        status = Status::InternalError(
-            std::string("cuCtxSetCurrent failed to restore the caller "
-                        "context") +
-            LOC_MARK);
+    if (restore_failed || restore_rc != CUDA_SUCCESS) {
+        constexpr char message[] =
+            "TENT: CUDA context restoration failed; retaining worker and copy admission\n";
+        (void)::write(STDERR_FILENO, message, sizeof(message) - 1);
+        while (true) (void)::poll(nullptr, 0, -1);
     }
     if (!status.ok()) {
         LOG(ERROR) << "CudaPlatform::copy failed: " << status.message();

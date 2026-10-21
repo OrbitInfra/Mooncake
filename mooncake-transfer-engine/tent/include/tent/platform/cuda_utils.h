@@ -19,6 +19,8 @@
 
 #include <mutex>
 
+#include "tent/common/status.h"
+
 namespace mooncake {
 namespace tent {
 
@@ -45,6 +47,36 @@ inline int getCudaDeviceForPtr(const void* ptr) {
         &dev_ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)ptr);
     if (res != CUDA_SUCCESS) return -1;
     return static_cast<int>(dev_ordinal);
+}
+
+// The multi-attribute API returns zero attributes successfully for ordinary
+// unregistered host pointers. Unlike the single-attribute API, no query error
+// is interpreted as host memory.
+inline Status cudaPointerDevice(const void* ptr, int& device) {
+    device = -1;
+    if (!ptr) return Status::InvalidArgument("Null CUDA copy pointer");
+    if (!ensureCudaDriverInit()) {
+        return Status::CudaError("CUDA driver initialization failed");
+    }
+    unsigned int memory_type = 0;
+    int ordinal = -1;
+    CUpointer_attribute attributes[] = {
+        CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+        CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+    };
+    void* values[] = {&memory_type, &ordinal};
+    auto result = cuPointerGetAttributes(2, attributes, values, (CUdeviceptr)ptr);
+    if (result != CUDA_SUCCESS) {
+        return Status::CudaError("CUDA pointer attributes query failed: " +
+                                 std::to_string(result));
+    }
+    if (memory_type == 0 || memory_type == CU_MEMORYTYPE_HOST) return Status::OK();
+    if ((memory_type != CU_MEMORYTYPE_DEVICE && memory_type != CU_MEMORYTYPE_UNIFIED) ||
+        ordinal < 0) {
+        return Status::CudaError("Unsupported CUDA pointer memory type or device");
+    }
+    device = ordinal;
+    return Status::OK();
 }
 
 }  // namespace tent
