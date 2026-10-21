@@ -20,6 +20,7 @@
 #include "tent/common/concurrent/rw_spinlock.h"
 
 #include <cuda_runtime.h>
+#include <atomic>
 
 namespace mooncake {
 namespace tent {
@@ -128,6 +129,8 @@ class CudaPlatform : public Platform {
    private:
     std::shared_ptr<Config> conf;
     CUDAStreamPool stream_pool;
+    std::atomic<size_t> copy_calls_{0};
+    std::atomic<size_t> copy_bytes_{0};
 };
 
 }  // namespace tent

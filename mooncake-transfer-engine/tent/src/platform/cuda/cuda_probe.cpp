@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/platform/cuda.h"
+#include "tent/platform/cuda_utils.h"
 #include "tent/common/status.h"
 #include "tent/common/utils/prefault.h"
 #include "tent/common/utils/random.h"
@@ -253,6 +254,14 @@ static void insertFallbackMemEntry(int nic_list_count,
 
 Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
                            std::vector<Topology::MemEntry>& mem_list) {
+    if (!ensureCudaDriverInit()) {
+        return Status::CudaError("CUDA driver initialization failed before transport admission");
+    }
+    int count = 0;
+    CHECK_CUDA(cudaGetDeviceCount(&count));
+    if (count <= 0) {
+        return Status::DeviceNotFound("CUDA bundle has no usable device");
+    }
     auto new_nic_list = listInfiniBandDevices();
     filterInfiniBandDevices(new_nic_list, conf);
     for (auto& entry : new_nic_list) nic_list.push_back(entry);
@@ -297,17 +306,10 @@ bool cudaAbiMatches() {
 }  // namespace
 
 MemoryType CudaPlatform::getMemoryType(void* addr) {
-    if (!cudaDevicePresent()) return MTYPE_CPU;
     if (!cudaAbiMatches()) return MTYPE_UNKNOWN;
-    cudaPointerAttributes attributes{};
-    cudaError_t result = cudaPointerGetAttributes(&attributes, addr);
-    if (result != cudaSuccess) {
-        LOG(WARNING) << "cudaPointerGetAttributes: "
-                     << cudaGetErrorString(result);
-        return MTYPE_UNKNOWN;
-    }
-    if (attributes.type == cudaMemoryTypeDevice) return MTYPE_CUDA;
-    return MTYPE_CPU;
+    int device = -1;
+    if (!cudaPointerDevice(addr, device).ok()) return MTYPE_UNKNOWN;
+    return device >= 0 ? MTYPE_CUDA : MTYPE_CPU;
 }
 
 static inline uintptr_t alignPage(uintptr_t address) {
@@ -336,17 +338,15 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
         return entries;
     }
     if (cudaDevicePresent()) {
-        cudaPointerAttributes attributes{};
-        cudaError_t result = cudaPointerGetAttributes(&attributes, start);
-        if (result != cudaSuccess) {
-            LOG(WARNING) << "cudaPointerGetAttributes: "
-                         << cudaGetErrorString(result);
+        // Unregistered pointers fall through to the NUMA probe below.
+        int cuda_dev = -1;
+        if (!cudaPointerDevice(start, cuda_dev).ok()) {
             entries.push_back({(uint64_t)start, len, kWildcardLocation});
             return entries;
         }
-        if (attributes.type == cudaMemoryTypeDevice) {
+        if (cuda_dev >= 0) {
             entries.push_back(
-                {(uint64_t)start, len, genCudaNodeName(attributes.device)});
+                {(uint64_t)start, len, genCudaNodeName(cuda_dev)});
             return entries;
         }
     }

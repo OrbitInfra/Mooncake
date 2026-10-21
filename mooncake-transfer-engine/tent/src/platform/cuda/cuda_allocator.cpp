@@ -13,15 +13,22 @@
 // limitations under the License.
 
 #include "tent/platform/cuda.h"
+#include "tent/platform/cuda_utils.h"
 #include "tent/common/status.h"
 
 #include <bits/stdint-uintn.h>
 #include <cuda_runtime.h>
+#include <cstring>
+#include <poll.h>
+#include <unistd.h>
 #include <numa.h>
 #include <glog/logging.h>
 
 namespace mooncake {
 namespace tent {
+namespace {
+}  // namespace
+
 Status CudaPlatform::allocate(void** pptr, size_t size,
                               MemoryOptions& options) {
     LocationParser location(options.location);
@@ -42,15 +49,12 @@ Status CudaPlatform::allocate(void** pptr, size_t size,
 }
 
 Status CudaPlatform::free(void* ptr, size_t size) {
-    cudaPointerAttributes attributes;
-    CHECK_CUDA(cudaPointerGetAttributes(&attributes, ptr));
-    if (attributes.type == cudaMemoryTypeDevice) {
+    int device = -1;
+    CHECK_STATUS(cudaPointerDevice(ptr, device));
+    if (device >= 0) {
         CHECK_CUDA(cudaFree(ptr));
-    } else if (attributes.type == cudaMemoryTypeHost ||
-               attributes.type == cudaMemoryTypeUnregistered) {
-        numa_free(ptr, size);
     } else {
-        LOG(ERROR) << "Unknown memory type, " << ptr << " " << attributes.type;
+        numa_free(ptr, size);
     }
     return Status::OK();
 }
@@ -60,12 +64,79 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     // as the latter relies on the legacy default stream and can introduce
     // unintended synchronization or even deadlocks in downstream
     // components (e.g. mooncake-pg).
-    CUDAStreamHandle stream;
-    CHECK_STATUS(getStreamFromPool(stream));
-    CHECK_CUDA(
-        cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
-    CHECK_CUDA(cudaStreamSynchronize(stream.get()));
-    return Status::OK();
+    //
+    // cudaMemcpyAsync routes the copy through its stream's device context, so
+    // the stream must live on the device owning the device-side buffer.
+    // Control-plane RPC worker threads sit on cuda:0 while a registered buffer
+    // may live on cuda:R; taking the stream from the buffer's device routes the
+    // copy correctly without mutating the calling thread's current device.
+    // Host-only copies keep the current device.
+    int destination_device = -1, source_device = -1;
+    CHECK_STATUS(cudaPointerDevice(dst, destination_device));
+    CHECK_STATUS(cudaPointerDevice(src, source_device));
+    const int device_id = destination_device >= 0 ? destination_device : source_device;
+    if (device_id < 0) {
+        ::memcpy(dst, src, length);
+        return Status::OK();
+    }
+
+    constexpr size_t max_copy_calls = 64;
+    constexpr size_t max_copy_bytes = size_t{1} << 30;
+    if (length > max_copy_bytes) return Status::TooManyRequests("CUDA copy byte admission");
+    const size_t calls = copy_calls_.fetch_add(1, std::memory_order_relaxed);
+    if (calls >= max_copy_calls) {
+        copy_calls_.fetch_sub(1, std::memory_order_relaxed);
+        return Status::TooManyRequests("CUDA copy call admission");
+    }
+    size_t bytes = copy_bytes_.load(std::memory_order_relaxed);
+    while (true) {
+        if (bytes > max_copy_bytes - length) {
+            copy_calls_.fetch_sub(1, std::memory_order_relaxed);
+            return Status::TooManyRequests("CUDA copy byte admission");
+        }
+        if (copy_bytes_.compare_exchange_weak(bytes, bytes + length, std::memory_order_relaxed)) break;
+    }
+    struct CopyAdmission {
+        std::atomic<size_t>& calls;
+        std::atomic<size_t>& bytes;
+        size_t length;
+        ~CopyAdmission() {
+            bytes.fetch_sub(length, std::memory_order_relaxed);
+            calls.fetch_sub(1, std::memory_order_relaxed);
+        }
+    } admission{copy_calls_, copy_bytes_, length};
+
+    CUcontext saved_context = nullptr;
+    CHECK_CU(cuCtxGetCurrent(&saved_context));
+    struct ContextRestore {
+        CUcontext context;
+        ~ContextRestore() {
+            if (cuCtxSetCurrent(context) != CUDA_SUCCESS) {
+                constexpr char message[] = "TENT: CUDA context restoration failed; retaining worker and copy admission\n";
+                (void)::write(STDERR_FILENO, message, sizeof(message) - 1);
+                while (true) (void)::poll(nullptr, 0, -1);
+            }
+        }
+    } restore{saved_context};
+    CHECK_CUDA(cudaSetDevice(device_id));
+    Status result;
+    {
+        CUDAStreamHandle stream;
+        result = getStreamFromPool(stream, device_id);
+        if (result.ok()) {
+            auto error = cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get());
+            if (error == cudaSuccess) error = cudaStreamSynchronize(stream.get());
+            if (error != cudaSuccess) {
+                // CUDA errors may report preceding async work. Keep this
+                // stream, admitted bytes and the caller's RPC scratch alive.
+                constexpr char message[] = "TENT: CUDA copy termination unproven; retaining stream, buffers and admission\n";
+                (void)::write(STDERR_FILENO, message, sizeof(message) - 1);
+                while (true) (void)::poll(nullptr, 0, -1);
+            }
+        }
+    }
+    return result;
 }
+
 }  // namespace tent
 }  // namespace mooncake
