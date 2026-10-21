@@ -58,7 +58,12 @@ thread_local CoroRpcAgent tl_rpc_agent;
 Status ControlClient::getSegmentDesc(const std::string& server_addr,
                                      std::string& response) {
     std::string request;
-    return tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
+    auto status = tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
+    if (status.IsRpcServiceError()) {
+        tl_rpc_agent.discardIdleConnections(server_addr);
+        return tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
+    }
+    return status;
 }
 
 Status ControlClient::bootstrap(const std::string& server_addr,

@@ -43,6 +43,7 @@ struct tent_request {
     uint64_t length;
     int priority;       /* Request priority (0=HIGH, 1=MEDIUM, 2=LOW) */
     int transport_hint; /* TRANSPORT_UNSPEC=follow policy, else pin transport */
+    char expected_source_epoch[33]; /* Empty for unbound native operations. */
 };
 
 typedef struct tent_request tent_request_t;
@@ -137,6 +138,10 @@ void tent_destroy_engine(tent_engine_t engine);
 // This does not drain requester batches or authorize individual ticket reuse.
 int tent_close_source(tent_engine_t engine, uint64_t timeout_ms,
                       char* epoch, uint64_t* active);
+
+int tent_source_epoch(tent_engine_t engine, char* epoch, size_t capacity);
+int tent_validate_remote_epoch(tent_engine_t engine, tent_segment_id_t segment,
+                               const char* expected);
 
 int tent_segment_name(tent_engine_t engine, char* buf, size_t buf_len);
 

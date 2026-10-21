@@ -148,6 +148,7 @@ struct Request {
     // When set, the engine emits an observability-only feasibility metric
     // (MLU = actual transfer time / available window) on completion; it does
     // not yet drive any admission or scheduling decision. See RFC #2519.
+    std::string expected_source_epoch;
     uint64_t deadline_ns = 0;
     IntentType intent_type = IntentType::INTENT_UNSPEC;
 };

@@ -237,8 +237,13 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
     std::string rpc_server_addr, source_epoch;
     auto status =
         findRemoteSegment(task->request.target_offset, task->request.length,
-                          task->request.target_id, rpc_server_addr, source_epoch);
+                          task->request.target_id, rpc_server_addr, source_epoch, task->request.expected_source_epoch);
     if (!status.ok()) return status;
+    if (!task->request.expected_source_epoch.empty()) {
+        if (source_epoch != task->request.expected_source_epoch)
+            return Status::RpcServiceError("Source grant epoch changed before first TCP attempt");
+        source_epoch = task->request.expected_source_epoch;
+    }
 
     Status last_error;
     uint64_t delay_ms = params_.retry_base_delay_ms;
@@ -287,7 +292,7 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
             std::string refreshed_epoch;
             auto resolve = findRemoteSegment(
                 task->request.target_offset, task->request.length,
-                task->request.target_id, rpc_server_addr, refreshed_epoch);
+                task->request.target_id, rpc_server_addr, refreshed_epoch, source_epoch);
             if (!resolve.ok()) return resolve;
             if (refreshed_epoch != source_epoch)
                 return Status::RpcServiceError("Source epoch changed during retry");
@@ -300,7 +305,7 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
 Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
                                        uint64_t target_id,
                                        std::string &rpc_server_addr,
-                                       std::string &source_epoch) {
+                                       std::string &source_epoch, const std::string &expected_epoch) {
     return metadata_->segmentManager().withCachedSegment(
         target_id, [&](SegmentDesc *segment) {
             auto buffer = segment->findBuffer(dest_addr, length);
@@ -313,6 +318,8 @@ Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
                 return Status::NeedsRefreshCache(
                     "Empty RPC server addr" LOC_MARK);
             }
+            if (!expected_epoch.empty() && buffer->source_epoch != expected_epoch)
+                return Status::NeedsRefreshCache("Worker source epoch requires refresh");
             source_epoch = buffer->source_epoch;
             return Status::OK();
         });

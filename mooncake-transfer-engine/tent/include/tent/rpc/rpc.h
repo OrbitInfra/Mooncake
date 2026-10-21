@@ -86,6 +86,7 @@ class CoroRpcAgent {
     Status start(uint16_t &port, bool ipv6 = false, size_t threads = 1);
 
     Status stop();
+    void discardIdleConnections(const std::string& server_addr);
     uint64_t closeDispatch(std::chrono::milliseconds timeout);
 
     Status call(const std::string &server_addr, int func_id,

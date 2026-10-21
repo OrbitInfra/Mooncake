@@ -213,6 +213,10 @@ Lazy<void> CoroRpcAgent::process(int func_id) {
     ctx->set_response_attachment(std::move(response));
 }
 
+void CoroRpcAgent::discardIdleConnections(const std::string& server_addr) {
+    getOrCreatePool(server_addr)->clear();
+}
+
 std::shared_ptr<ClientPool> CoroRpcAgent::getOrCreatePool(
     const std::string& server_addr) {
     std::lock_guard<std::mutex> lock(pools_mutex_);

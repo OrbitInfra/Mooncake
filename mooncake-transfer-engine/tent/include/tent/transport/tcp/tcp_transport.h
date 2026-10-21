@@ -107,7 +107,7 @@ class TcpTransport : public Transport {
 
     Status findRemoteSegment(uint64_t dest_addr, uint64_t length,
                              uint64_t target_id, std::string &rpc_server_addr,
-                             std::string &source_epoch);
+                             std::string &source_epoch, const std::string &expected_epoch);
 
    private:
     bool installed_;

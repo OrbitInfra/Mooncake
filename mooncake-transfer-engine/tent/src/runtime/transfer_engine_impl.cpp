@@ -852,6 +852,28 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
 
 // WARNING: before exiting TE, make sure that all local memory are
 // unregistered, otherwise the CUDA may halt!
+int TransferEngineImpl::sourceEpoch(char* epoch, size_t capacity) {
+    if (!available_ || !metadata_ || !epoch || capacity < 33 ||
+        metadata_->sourceEpoch().size() != 32) return -1;
+    memcpy(epoch, metadata_->sourceEpoch().c_str(), 33);
+    return 0;
+}
+
+Status TransferEngineImpl::validateRemoteEpoch(SegmentID segment, const std::string& expected) {
+    if (!available_ || !metadata_ || expected.size() != 32)
+        return Status::InvalidArgument("Invalid expected source epoch");
+    auto& manager = metadata_->segmentManager();
+    if (segment != LOCAL_SEGMENT_ID) CHECK_STATUS(manager.invalidateRemote(segment));
+    return manager.withCachedSegment(segment, [&](SegmentDesc* desc) {
+        if (!desc || desc->type != SegmentType::Memory || desc->getMemory().buffers.empty())
+            return Status::InvalidArgument("Source has no registered buffers");
+        for (const auto& buffer : desc->getMemory().buffers)
+            if (buffer.source_epoch != expected)
+                return Status::InvalidArgument("Native source epoch changed before submission");
+        return Status::OK();
+    });
+}
+
 int TransferEngineImpl::closeSource(uint64_t timeout_ms, char* epoch, uint64_t* active) {
     if (!available_ || !metadata_ || !epoch || !active || timeout_ms > 5000 ||
         metadata_->sourceEpoch().size() != 32) return -1;
@@ -1343,6 +1365,8 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
         if (a.req.opcode != b.req.opcode) return a.req.opcode < b.req.opcode;
         if (a.req.target_id != b.req.target_id)
             return a.req.target_id < b.req.target_id;
+        if (a.req.expected_source_epoch != b.req.expected_source_epoch)
+            return a.req.expected_source_epoch < b.req.expected_source_epoch;
         if (a.req.transport_hint != b.req.transport_hint)
             return a.req.transport_hint < b.req.transport_hint;
         if (a.req.target_offset != b.req.target_offset)
@@ -1356,7 +1380,8 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
             return false;
         }
         // Mixed transport_hint inside one batch must not be merged.
-        if (last.req.transport_hint != curr.req.transport_hint) {
+        if (last.req.expected_source_epoch != curr.req.expected_source_epoch ||
+            last.req.transport_hint != curr.req.transport_hint) {
             return false;
         }
         if (!last.boundary.source_key || !curr.boundary.source_key ||
