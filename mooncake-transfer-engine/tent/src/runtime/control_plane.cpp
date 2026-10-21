@@ -13,6 +13,10 @@
 // limitations under the License.
 
 #include "tent/runtime/control_plane.h"
+#include <sys/random.h>
+#include <array>
+#include <limits>
+#include <stdexcept>
 #include "tent/runtime/transfer_engine_impl.h"
 
 #include <cassert>
@@ -121,12 +125,14 @@ Status ControlClient::bootstrapUb(const std::string& server_addr,
 
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
-                               size_t length) {
+                               size_t length, const std::string& source_epoch) {
     // Check before addition/allocation or reading the caller's source buffer.
     if (length > kTcpMaxWriteBytes)
         return Status::InvalidArgument("TCP WRITE exceeds RPC payload limit");
     std::string response;
-    XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
+    XferDataDesc desc{htole64(peer_mem_addr), htole64(length), {}};
+    if (source_epoch.size() != 32) return Status::InvalidArgument("Invalid source epoch");
+    memcpy(desc.source_epoch, source_epoch.data(), 32);
     std::string request;
     request.reserve(sizeof(XferDataDesc) + length);
     request.resize(sizeof(XferDataDesc));
@@ -152,19 +158,21 @@ Status ControlClient::sendData(const std::string& server_addr,
 
 Status ControlClient::recvData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
-                               size_t length) {
+                               size_t length, const std::string& source_epoch) {
     if (length > kTcpMaxReadBytes)
         return Status::InvalidArgument("TCP READ exceeds RPC payload limit");
     std::string request, response;
-    XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
+    XferDataDesc desc{htole64(peer_mem_addr), htole64(length), {}};
+    if (source_epoch.size() != 32) return Status::InvalidArgument("Invalid source epoch");
+    memcpy(desc.source_epoch, source_epoch.data(), 32);
     request.resize(sizeof(XferDataDesc));
     memcpy(&request[0], &desc, sizeof(desc));
     auto status = tl_rpc_agent.call(server_addr, RecvData, request, response);
     if (!status.ok()) return status;
-    if (response.size() != length)
+    if (response.empty() || length == SIZE_MAX || response.size() != length + 1 || response[0] != 0)
         return Status::RpcServiceError(
             response.empty() ? "RecvData failed: empty response" : response);
-    return Platform::getLoader().copy(local_mem_addr, response.data(), length);
+    return Platform::getLoader().copy(local_mem_addr, response.data() + 1, length);
 }
 
 inline void to_json(nlohmann::json& j, const Notification& n) {
@@ -257,7 +265,11 @@ Status ControlClient::pinStageBuffer(const std::string& server_addr,
     request_raw = j.dump();
     CHECK_STATUS(
         tl_rpc_agent.call(server_addr, Pin, request_raw, response_raw));
-    addr = json::parse(response_raw).get<uint64_t>();
+    try {
+        addr = json::parse(response_raw).get<uint64_t>();
+    } catch (const std::exception&) {
+        return Status::RpcServiceError(response_raw);
+    }
     return Status::OK();
 }
 
@@ -268,7 +280,7 @@ Status ControlClient::unpinStageBuffer(const std::string& server_addr,
     request_raw = j.dump();
     CHECK_STATUS(
         tl_rpc_agent.call(server_addr, Unpin, request_raw, response_raw));
-    return Status::OK();
+    return response_raw.empty() ? Status::OK() : Status::RpcServiceError(response_raw);
 }
 
 void ControlClient::unpinStageBufferAsync(const std::string& server_addr,
@@ -294,6 +306,14 @@ ControlService::ControlService(const std::string& type,
                                const std::string& servers,
                                TransferEngineImpl* impl)
     : bootstrap_callback_(nullptr), notify_callback_(nullptr), impl_(impl) {
+    std::array<unsigned char, 16> epoch{};
+    if (getrandom(epoch.data(), epoch.size(), 0) == static_cast<ssize_t>(epoch.size())) {
+        constexpr char hex[] = "0123456789abcdef";
+        for (auto byte : epoch) {
+            source_epoch_.push_back(hex[byte >> 4]);
+            source_epoch_.push_back(hex[byte & 15]);
+        }
+    }
     if (type == "p2p") {
         auto agent = std::make_unique<PeerSegmentRegistry>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
@@ -431,6 +451,7 @@ void ControlService::finishNotifyCallback() {
 }
 
 Status ControlService::start(uint16_t& port, bool ipv6_, size_t threads) {
+    if (source_epoch_.size() != 32) return Status::InternalError("Source epoch entropy unavailable");
     return rpc_server_->start(port, ipv6_, threads);
 }
 
@@ -519,13 +540,78 @@ void ControlService::onBootstrapUb(const std::string_view& request,
     response = j.dump();
 }
 
+bool ControlService::sourceClosed() {
+    std::lock_guard<std::mutex> guard(source_mutex_);
+    return source_closed_;
+}
+
+void ControlService::markSourceReady(bool supported) {
+    std::lock_guard<std::mutex> guard(source_mutex_);
+    source_drain_supported_ = supported;
+    source_ready_ = true;
+}
+
+bool ControlService::beginAuxiliary() {
+    std::lock_guard<std::mutex> guard(source_mutex_);
+    if (!source_ready_ || source_closed_ || source_drain_supported_ ||
+        source_active_ == std::numeric_limits<uint64_t>::max()) return false;
+    ++source_active_;
+    return true;
+}
+
+void ControlService::stop() {
+    {
+        std::lock_guard<std::mutex> guard(source_mutex_);
+        source_closed_ = true;
+        source_ready_ = false;
+    }
+    rpc_server_.reset();
+}
+
+uint64_t ControlService::closeSource(uint64_t timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    rpc_server_->closeDispatch(std::chrono::milliseconds(0));
+    uint64_t active;
+    {
+        std::unique_lock<std::mutex> guard(source_mutex_);
+        source_closed_ = true;
+        source_cv_.wait_until(guard, deadline, [this] { return source_active_ == 0; });
+        active = source_active_;
+    }
+    const auto remaining = std::max(std::chrono::milliseconds(0),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()));
+    return std::max(active, rpc_server_->closeDispatch(remaining));
+}
+
+bool ControlService::beginSource(const char* epoch) {
+    std::lock_guard<std::mutex> guard(source_mutex_);
+    if (!source_ready_ || source_closed_ || memcmp(epoch, source_epoch_.data(), 32) != 0 ||
+        epoch[32] != 0 || source_active_ == std::numeric_limits<uint64_t>::max())
+        return false;
+    ++source_active_;
+    return true;
+}
+
+void ControlService::finishSource() {
+    std::lock_guard<std::mutex> guard(source_mutex_);
+    --source_active_;
+    source_cv_.notify_all();
+}
+
 void ControlService::onSendData(const std::string_view& request,
                                 std::string& response) {
     if (request.size() < sizeof(XferDataDesc)) {
         response = "SendData failed: request too short";
         return;
     }
-    XferDataDesc* desc = (XferDataDesc*)request.data();
+    XferDataDesc value{};
+    memcpy(&value, request.data(), sizeof(value));
+    const auto* desc = &value;
+    if (!beginSource(desc->source_epoch)) {
+        response = "Source admission closed or epoch mismatch";
+        return;
+    }
+    CallbackInvocationGuard source_guard([this] { finishSource(); });
     auto local_desc = manager_->getLocal();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
@@ -543,7 +629,7 @@ void ControlService::onSendData(const std::string_view& request,
             return;
         }
         auto status =
-            Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
+            Platform::getLoader().copy((void*)peer_mem_addr, const_cast<char*>(request.data()) + sizeof(XferDataDesc), length);
         if (!status.ok()) {
             // A non-empty response is interpreted as an RPC error by the
             // client (see ControlClient::sendData). Without this the sender's
@@ -562,7 +648,14 @@ void ControlService::onRecvData(const std::string_view& request,
         response = "RecvData failed: request too short";
         return;
     }
-    XferDataDesc* desc = (XferDataDesc*)request.data();
+    XferDataDesc value{};
+    memcpy(&value, request.data(), sizeof(value));
+    const auto* desc = &value;
+    if (!beginSource(desc->source_epoch)) {
+        response = "Source admission closed or epoch mismatch";
+        return;
+    }
+    CallbackInvocationGuard source_guard([this] { finishSource(); });
     auto local_desc = manager_->getLocal();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
@@ -598,8 +691,10 @@ void ControlService::onRecvData(const std::string_view& request,
                 loader.copy(response.data(), (void*)peer_mem_addr, length);
             if (!status.ok()) {
                 fail("RecvData failed: copy: " + status.ToString());
+                return;
             }
         }
+        response.insert(response.begin(), 0);
     } else {
         fail("RecvData failed: target address not in registered buffer");
     }
@@ -658,6 +753,11 @@ void ControlService::onProbe(const std::string_view& request,
 
 void ControlService::onDelegate(const std::string_view& request,
                                 std::string& response) {
+    if (!beginAuxiliary()) {
+        response = "Delegated pointer transfers are unsupported or source admission closed";
+        return;
+    }
+    CallbackInvocationGuard source_guard([this] { finishSource(); });
     Request user_request = json::parse(std::string(request)).get<Request>();
     auto status = impl_->transferSync({user_request});
     if (!status.ok()) response = status.ToString();
@@ -665,6 +765,11 @@ void ControlService::onDelegate(const std::string_view& request,
 
 void ControlService::onPinStageBuffer(const std::string_view& request,
                                       std::string& response) {
+    if (!beginAuxiliary()) {
+        response = "Source pointer admission closed or unsupported";
+        return;
+    }
+    CallbackInvocationGuard source_guard([this] { finishSource(); });
     std::string location = json::parse(request).get<std::string>();
     uint64_t addr = impl_->lockStageBuffer(location);
     json j = addr;
@@ -673,6 +778,11 @@ void ControlService::onPinStageBuffer(const std::string_view& request,
 
 void ControlService::onUnpinStageBuffer(const std::string_view& request,
                                         std::string& response) {
+    if (!beginAuxiliary()) {
+        response = "Source pointer admission closed or unsupported";
+        return;
+    }
+    CallbackInvocationGuard source_guard([this] { finishSource(); });
     uint64_t addr = json::parse(request).get<uint64_t>();
     impl_->unlockStageBuffer(addr);
 }

@@ -423,6 +423,8 @@ class TransferEngineImpl {
     // an idempotent "maybe ready" signal.
     void notifyBatchMaybeReady(BatchID batch_id,
                                bool poll_until_terminal = false);
+    int closeSource(uint64_t timeout_ms, char* epoch, uint64_t* active);
+    bool supportsSourceDrain();
 
    private:
     friend class ProgressWorker;

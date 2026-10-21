@@ -71,6 +71,7 @@ struct BufferDesc {
     std::unordered_map<TransportType, std::string> transport_attrs;
     // mutable elements
     int ref_count{0};
+    std::string source_epoch;
 
     // backward compatilble
     std::vector<uint32_t> rkey;
@@ -85,7 +86,7 @@ struct BufferDesc {
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(BufferDesc, addr, length, location,
                                    transports, regions, transport_attrs, rkey,
-                                   shm_path, mnnvl_handle, internal);
+                                   shm_path, mnnvl_handle, internal, source_epoch);
 };
 
 struct FileBufferDesc {

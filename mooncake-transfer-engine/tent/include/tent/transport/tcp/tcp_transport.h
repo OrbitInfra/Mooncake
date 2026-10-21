@@ -123,7 +123,8 @@ class TcpTransport : public Transport {
     Status doTransferWithRetry(TcpTask *task);
 
     Status findRemoteSegment(uint64_t dest_addr, uint64_t length,
-                             uint64_t target_id, std::string &rpc_server_addr);
+                             uint64_t target_id, std::string &rpc_server_addr,
+                             std::string &source_epoch);
 
    private:
     bool installed_;

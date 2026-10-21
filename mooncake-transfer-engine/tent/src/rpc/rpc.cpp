@@ -146,6 +146,10 @@ Status CoroRpcAgent::start(uint16_t& port, bool ipv6, size_t threads) {
                 port = 0;
                 continue;
             }
+            {
+                std::lock_guard<std::mutex> guard(dispatch_mutex_);
+                dispatch_closed_ = false;
+            }
             running_ = true;
             return Status::OK();
         } catch (const std::exception& e) {
@@ -157,7 +161,26 @@ Status CoroRpcAgent::start(uint16_t& port, bool ipv6, size_t threads) {
     return Status::RpcServiceError("Failed to bind any RPC port" LOC_MARK);
 }
 
+uint64_t CoroRpcAgent::closeDispatch(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> guard(dispatch_mutex_);
+    dispatch_closed_ = true;
+    dispatch_cv_.wait_for(guard, timeout, [this] { return dispatch_active_ == 0; });
+    return dispatch_active_;
+}
+
+void CoroRpcAgent::finishDispatch() {
+    std::lock_guard<std::mutex> guard(dispatch_mutex_);
+    --dispatch_active_;
+    dispatch_cv_.notify_all();
+}
+
 Status CoroRpcAgent::stop() {
+    {
+        std::unique_lock<std::mutex> guard(dispatch_mutex_);
+        dispatch_closed_ = true;
+        // Keep I/O alive until queued global-executor handlers resume and finish.
+        dispatch_cv_.wait(guard, [this] { return dispatch_active_ == 0; });
+    }
     if (server_) {
         server_->stop();
         delete server_;
@@ -174,6 +197,15 @@ Status CoroRpcAgent::stop() {
 
 Lazy<void> CoroRpcAgent::process(int func_id) {
     auto* ctx = co_await coro_rpc::get_context_in_coro();
+    {
+        std::lock_guard<std::mutex> guard(dispatch_mutex_);
+        if (dispatch_closed_ || dispatch_active_ == UINT64_MAX) {
+            ctx->set_response_attachment(std::string("RPC dispatch admission closed"));
+            co_return;
+        }
+        ++dispatch_active_;
+    }
+    DispatchGuard dispatch_guard(*this);
     // registerFunction() may run while the server is serving, and a rehash
     // under a bare find() is a data race. The handler is copied out and the
     // lock released before the coroutine can suspend below.
