@@ -29,7 +29,7 @@ jobs:
             liburing-dev libfmt-dev libcli11-dev libunwind-dev python3-dev patchelf
       - name: Install CUDA 13 toolkit for compile and injected tests
         if: matrix.cuda == 'ON'
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
           cuda: '13.0.2'
           method: network
