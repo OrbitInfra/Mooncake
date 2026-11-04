@@ -84,6 +84,7 @@ struct TaskInfo {
     int failover_count{0};                // number of failover attempts
     int metadata_refresh_retry_count{0};  // same-transport stale-cache retries
     bool suppress_failover{false};        // permanent transport result
+    TransferStatus terminal_result{PENDING, 0};
     LogicalTransferRuntimePolicy runtime_policy;
     uint64_t device_mask{~0ULL};  // Device mask for quota allocation
     std::string qp_pool;          // Named QP pool (RFC #2568 step 3), "" = none
@@ -132,6 +133,7 @@ struct TaskInfo {
           failover_count(other.failover_count),
           metadata_refresh_retry_count(other.metadata_refresh_retry_count),
           suppress_failover(other.suppress_failover),
+          terminal_result(other.terminal_result),
           runtime_policy(other.runtime_policy),
           device_mask(other.device_mask),
           qp_pool(other.qp_pool),
@@ -163,6 +165,7 @@ struct TaskInfo {
           failover_count(other.failover_count),
           metadata_refresh_retry_count(other.metadata_refresh_retry_count),
           suppress_failover(other.suppress_failover),
+          terminal_result(other.terminal_result),
           runtime_policy(other.runtime_policy),
           device_mask(other.device_mask),
           qp_pool(std::move(other.qp_pool)),
@@ -195,6 +198,7 @@ struct TaskInfo {
             failover_count = other.failover_count;
             metadata_refresh_retry_count = other.metadata_refresh_retry_count;
             suppress_failover = other.suppress_failover;
+            terminal_result = other.terminal_result;
             runtime_policy = other.runtime_policy;
             device_mask = other.device_mask;
             qp_pool = other.qp_pool;
@@ -231,6 +235,7 @@ struct TaskInfo {
             failover_count = other.failover_count;
             metadata_refresh_retry_count = other.metadata_refresh_retry_count;
             suppress_failover = other.suppress_failover;
+            terminal_result = other.terminal_result;
             runtime_policy = other.runtime_policy;
             device_mask = other.device_mask;
             qp_pool = std::move(other.qp_pool);
@@ -370,6 +375,11 @@ class TransferEngineImpl {
                              std::vector<TransferStatus>& status_list);
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
+
+    // Observes cached terminal evidence only; never dispatches or retries.
+    // SIZE_MAX selects all tasks. TooManyRequests means not yet terminal.
+    Status getTerminalResult(BatchID batch_id, size_t task_id,
+                             Status::Code& code, bool& effect_known);
 
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 

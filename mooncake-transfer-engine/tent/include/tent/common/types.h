@@ -23,6 +23,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "tent/common/status.h"
+
 namespace mooncake {
 namespace tent {
 
@@ -214,6 +216,10 @@ inline int transferStatusSeverity(TransferStatusEnum s) {
 struct TransferStatus {
     TransferStatusEnum s;
     size_t transferred_bytes;
+    // Optional terminal evidence. Backends without an effect receipt remain
+    // conservative. This is not a physical-quiescence or buffer-release flag.
+    Status::Code error_code{Status::Code::kRpcUnknownEffect};
+    bool effect_known{false};
 };
 
 // One RDMA NIC's load snapshot. Only NICs currently able to carry traffic

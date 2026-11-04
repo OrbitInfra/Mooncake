@@ -2833,6 +2833,7 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
                                                  owner.staging_params);
             if (!status.ok()) {
                 task.staging = false;
+                task.terminal_result = {FAILED, 0, status.code(), false};
                 task.type = UNSPEC;
             } else {
                 task.post_time = std::chrono::steady_clock::now();
@@ -2853,6 +2854,7 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
                 // the completion pass below closes its logical accounting
                 // after the start token has been established.
                 task.status = FAILED;
+                task.terminal_result = {FAILED, 0, status.code(), true};
                 task.failure_stage = 0;
                 task.suppress_failover = true;
                 merged_task_id_map[merged_task_id] = task;
@@ -2957,6 +2959,8 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
                     for (const auto public_task_id :
                          public_tasks_by_physical_owner.at(physical_task_id)) {
                         auto& task = batch->task_list[public_task_id];
+                        task.terminal_result = {FAILED, 0, status.code(),
+                                                false};
                         if (task.failure_stage < 0) task.failure_stage = 0;
                         finishTransportAttempt(task, FAILED, attempt_end);
                     }
@@ -3226,7 +3230,10 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
             // non-staging path below.
             auto status =
                 staging_proxy_->submit(&task, (BatchID)batch, staging_params);
-            if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
+            if (!status.ok()) {
+                task.terminal_result = {FAILED, 0, status.code(), false};
+                return finishQueuedOwner(owner_id, FAILED);
+            }
             task.post_time = std::chrono::steady_clock::now();
             return markQueuedOwnerSubmitted(owner_id);
         }
@@ -3237,7 +3244,10 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         if (!transport) return finishQueuedOwner(owner_id, FAILED);
         auto status = transport->allocateSubBatch(batch->sub_batch[task.type],
                                                   batch->max_size);
-        if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
+        if (!status.ok()) {
+            task.terminal_result = {FAILED, 0, status.code(), false};
+            return finishQueuedOwner(owner_id, FAILED);
+        }
         attachProgressNotifier(batch, batch->sub_batch[task.type]);
     }
 
@@ -3252,6 +3262,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     startTransportAttempt(task, task.type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
+        task.terminal_result = {FAILED, 0, status.code(), false};
         if (task.failure_stage < 0) task.failure_stage = 0;
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
         // Submit-stage failover: walk the remaining candidate transports
@@ -3630,6 +3641,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     startTransportAttempt(task, type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
+        task.terminal_result = {FAILED, 0, status.code(), false};
         if (task.failure_stage < 0) task.failure_stage = 0;
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
     }
@@ -3674,7 +3686,8 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
     // particular, an UNSPEC task canceled before publication must not be
     // reinterpreted as FAILED merely because it has no transport SubBatch.
     if (task.status != PENDING) {
-        task_status = {task.status, 0};
+        task_status = task.terminal_result;
+        task_status.s = task.status;
         return Status::OK();
     }
     if (task.staging) {
@@ -3682,6 +3695,7 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
     }
 
     if (task.type == UNSPEC) {
+        task_status = task.terminal_result;
         task_status.s = FAILED;
         task_status.transferred_bytes = 0;
         return Status::OK();
@@ -3692,11 +3706,13 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
     if (!transport || !sub_batch) {
         return Status::InvalidArgument("Transport not available" LOC_MARK);
     }
-    // HP TCP classifies transport errors using the terminal output. Other
-    // transports retain their existing error-output contract.
-    if (task.type == HP_TCP) task_status = {PENDING, 0};
+    // Initialize optional terminal evidence even for legacy backends which
+    // only fill the logical state and byte count.
+    task_status = {PENDING, 0};
     Status result =
         transport->getTransferStatus(sub_batch, task.sub_task_id, task_status);
+    if (!result.ok() && task_status.s == FAILED)
+        task_status.error_code = result.code();
     if (task.type == TCP && task_status.s == FAILED &&
         result.IsRpcServiceError()) {
         // Standard TCP reports a non-replayable data RPC through this error
@@ -3759,7 +3775,15 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
                                                    TransferStatus& task_status,
                                                    bool allow_failover) {
     auto& task = batch->task_list[task_id];
+    const bool was_pending = task.status == PENDING;
     task.status = task_status.s;
+    if (was_pending && task_status.s != PENDING) {
+        task.terminal_result = task_status;
+        // A later pre-dispatch rejection cannot prove an earlier attempt
+        // had no effect. Retain uncertainty across failover.
+        if (task.failover_count != 0 && task_status.s != COMPLETED)
+            task.terminal_result.effect_known = false;
+    }
     // First-failure attribution: a terminal failure observed by polling marks
     // the poll stage. Submit-stage failures were already marked at their
     // origin and are not overwritten (a poll failure followed by a rejected
@@ -4144,6 +4168,53 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
 Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
                                              TransferStatus& overall_status) {
     return getBatchStatus(batch_id, overall_status, false);
+}
+
+Status TransferEngineImpl::getTerminalResult(BatchID batch_id, size_t task_id,
+                                             Status::Code& code,
+                                             bool& effect_known) {
+    code = Status::Code::kRpcUnknownEffect;
+    effect_known = false;
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id))
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+    const auto* batch = reinterpret_cast<const Batch*>(batch_id);
+    const bool all = task_id == std::numeric_limits<size_t>::max();
+    if (!all && task_id >= batch->task_list.size())
+        return Status::InvalidArgument("Invalid task ID" LOC_MARK);
+
+    auto aggregate = Status::Code::kOk;
+    bool known = true;
+    const size_t begin = all ? 0 : task_id;
+    const size_t end = all ? batch->task_list.size() : task_id + 1;
+    for (size_t id = begin; id < end; ++id) {
+        const auto& alias = batch->task_list[id];
+        const size_t owner = alias.derived ? alias.physical_owner_task_id : id;
+        if (owner >= batch->task_list.size())
+            return Status::InvalidArgument("Invalid physical owner" LOC_MARK);
+        const auto& task = batch->task_list[owner];
+        if (task.status == PENDING || task.status == INITIAL)
+            return Status::TooManyRequests("Task is not terminal" LOC_MARK);
+        auto result = task.terminal_result;
+        if (task.status == COMPLETED) {
+            result.error_code = Status::Code::kOk;
+            result.effect_known = true;
+        } else if (task.status != FAILED ||
+                   result.error_code == Status::Code::kOk) {
+            result.error_code = Status::Code::kRpcUnknownEffect;
+            result.effect_known = false;
+        }
+        if (result.error_code == Status::Code::kRpcUnknownEffect)
+            result.effect_known = false;
+        if (aggregate == Status::Code::kOk ||
+            result.error_code == Status::Code::kRpcUnknownEffect)
+            aggregate = result.error_code;
+        known = known && result.effect_known;
+    }
+    code = aggregate;
+    effect_known = known;
+    return Status::OK();
 }
 
 Status TransferEngineImpl::progressBatch(BatchID batch_id,

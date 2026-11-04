@@ -199,6 +199,11 @@ Status TcpTransport::getTransferStatus(SubBatchRef batch, int task_id,
     status.s = task.status_word.load(std::memory_order_acquire);
     status.transferred_bytes =
         task.transferred_bytes.load(std::memory_order_acquire);
+    if (status.s == TransferStatusEnum::FAILED) {
+        status.error_code = task.failure_status.code();
+        status.effect_known = task.failure_status.IsRpcConnectionError() ||
+                              task.failure_status.IsTooManyRequests();
+    }
     if (status.s == TransferStatusEnum::FAILED && task.non_replayable_failure)
         return task.failure_status;
     return Status::OK();
@@ -238,12 +243,17 @@ void TcpTransport::startTransfer(TcpTask *task) {
             LOG_EVERY_N(WARNING, 100)
                 << "TCP transfer failed: " << status.ToString();
         }
+        task->failure_status = std::move(status);
     } catch (const std::exception &error) {
         // enqueue() stores exceptions in a future which the submit path does
         // not consume. Convert failures here while task is still owned.
         LOG(WARNING) << "TCP worker exception: " << error.what();
+        task->failure_status = Status::RpcUnknownEffect("TCP worker exception");
+        task->non_replayable_failure = true;
     } catch (...) {
         LOG(WARNING) << "TCP worker exception: unknown exception";
+        task->failure_status = Status::RpcUnknownEffect("TCP worker exception");
+        task->non_replayable_failure = true;
     }
     if (completed) {
         // Store bytes before status: a reader who acquires COMPLETED will

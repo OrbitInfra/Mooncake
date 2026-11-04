@@ -65,6 +65,39 @@ typedef struct tent_status tent_status_t;
 
 typedef void* tent_engine_t;
 
+/* Generic int-returning operations: 0 on success, otherwise the negative
+ * native TENT Status::Code (not errno). Invalid arguments return -1;
+ * caught exceptions/wrapper allocation failures return -199. Exceptions to
+ * this convention: tent_available returns a boolean; tent_close_source has
+ * its documented drain result; the file API uses positive TENT_FILE_* codes.
+ * Handle/pointer/void-returning functions retain their existing contracts.
+ * A failure is not a physical drain receipt. A code alone does not authorize
+ * replay of an entire batch: earlier accepted tasks may have taken effect. */
+#define TENT_ERROR_TOO_MANY_REQUESTS 2
+#define TENT_ERROR_RPC_CONNECTION 134
+#define TENT_ERROR_RPC_UNKNOWN_EFFECT 135
+
+/* A connection error is before RPC dispatch; unknown effect means the request
+ * may have reached the peer. Never replay an unknown-effect WRITE. */
+
+#define TENT_ALL_TASKS SIZE_MAX
+
+/* Query a cached terminal task, or the whole batch with TENT_ALL_TASKS.
+ * Returns 0 when terminal, -2 while pending, -1 for an invalid handle/index.
+ * On success, status_code is POSITIVE native code (0 for COMPLETED) and
+ * effect_known is 1 only with an outcome receipt. Missing failure evidence,
+ * timeout or cancellation conservatively reports 135/0. Other failures keep
+ * their native code even when effect_known is 0. This query does not progress,
+ * dispatch, retry or release anything; poll with tent_task/overall_status.
+ * Batch: all tasks must be terminal; 135 takes precedence, otherwise the
+ * first nonzero code in task order wins; effect_known is the AND of all tasks.
+ * A known batch outcome is not permission to replay its successful tasks.
+ * On query error the outputs are initialized to 135/0. Receipts remain valid
+ * until tent_free_batch. Neither a terminal state nor effect_known proves
+ * physical quiescence or permits releasing registrations/buffers. */
+int tent_terminal_result(tent_engine_t engine, tent_batch_id_t batch_id,
+                         size_t task_id, int* status_code, int* effect_known);
+
 /* OrbitKV file API. Additive; independent of the generic logical batch API. */
 typedef enum tent_file_error {
     TENT_FILE_OK = 0,

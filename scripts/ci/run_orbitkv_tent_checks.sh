@@ -46,7 +46,7 @@ if [[ "$cuda" == ON ]]; then
     pattern='^tent_(orbitkv_abi|orbitkv_cuda_ownership|cuda_plugin_context|gds_transport_status)_test$'
   fi
 else
-  targets=(tent_orbitkv_abi_test tent_orbitkv_file_io_test
+  targets=(tent_orbitkv_abi_test tent_orbitkv_file_io_test tent_orbitkv_c_status_test
            tent_tcp_transport_test tent_tcp_regression_test
            tent_tcp_datapath_roundtrip_test segment_manager_test
            tent_local_memory_lifecycle_test tent_endpoint_lifecycle_test
@@ -56,7 +56,7 @@ else
            tent_transport_selector_test request_merge_test
            tent_runtime_queue_dispatch_test tent_engine_failover_e2e_test
            tent_progress_worker_test)
-  pattern='^(segment_manager_test|request_merge_test|tent_(orbitkv_abi|orbitkv_file_io|tcp_transport|tcp_regression|tcp_datapath_roundtrip|local_memory_lifecycle|endpoint_lifecycle|rdma_transport|io_uring_transport|segment_desc_retry|rpc_reconnect|rpc_handler_isolation|bootstrap_response|transport_selector|runtime_queue_dispatch|engine_failover_e2e|progress_worker)_test.*)$'
+  pattern='^(segment_manager_test|request_merge_test|tent_(orbitkv_abi|orbitkv_file_io|orbitkv_c_status|tcp_transport|tcp_regression|tcp_datapath_roundtrip|local_memory_lifecycle|endpoint_lifecycle|rdma_transport|io_uring_transport|segment_desc_retry|rpc_reconnect|rpc_handler_isolation|bootstrap_response|transport_selector|runtime_queue_dispatch|engine_failover_e2e|progress_worker)_test.*)$'
 fi
 cmake --build "$build_dir" --target "${targets[@]}" --parallel "$jobs"
 mkdir -p "$build_dir/test-results/gtest"

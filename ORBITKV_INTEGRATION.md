@@ -194,8 +194,8 @@ yalantinglibs does not expose write-byte counts, so even an EPIPE after
 `call_for()` begins is conservatively unknown. Both READ and WRITE follow this
 rule. `RpcUnknownEffect` remains in the RPC-service-error family for existing
 callers. TCP publishes `FAILED` and suppresses automatic transport failover for
-unknown data-RPC outcomes; the public batch API retains its existing status
-reporting convention. Metadata, notification, and probe wrappers and the outer TCP retry loop no
+unknown data-RPC outcomes. The existing logical batch status enum is unchanged;
+`tent_terminal_result` now exposes the native code and effect certainty (below). Metadata, notification, and probe wrappers and the outer TCP retry loop no
 longer replay calls or multiply the RPC retry/deadline budget. Legacy TCP retry/backoff
 configuration remains accepted but cannot authorize extra attempts.
 
@@ -319,6 +319,93 @@ The final TCP stress log has SHA-256
 `cad497a945699ca75ed3d4c0899c492487ace477e568264de5186c6f8a389bd6`.
 Physical GPU, RDMA, and GDS behavior is not
 established by these CPU/socket tests or the hosted CUDA fault-injection leg.
+
+## Native status codes at the C boundary (OrbitKV patch)
+
+OrbitKV #314 found that the C wrapper reduced every native failure to `-1`,
+and that logical `FAILED` completion discarded the data RPC's failure code.
+Generic integer-returning C operations now return `0` for success or the
+**negative native `Status::Code`**, including `-134` (before dispatch), `-135`
+(unknown effect after dispatch), and `-2` (capacity/admission rejection).
+This applies to open/close/info, memory allocation and registration, submit and
+submit-with-notification, notifications, polling, cancellation, NIC stats, and
+remote epoch validation. Invalid arguments remain `-1`. Caught exceptions and
+wrapper allocation failures use `-199`. The boolean, pointer/handle, source
+close/drain, and positive `TENT_FILE_*` contracts are unchanged.
+
+All 23 consumed signatures and all existing C struct layouts remain unchanged.
+One C function and four constants are added:
+
+```c
+#define TENT_ERROR_TOO_MANY_REQUESTS 2
+#define TENT_ERROR_RPC_CONNECTION 134
+#define TENT_ERROR_RPC_UNKNOWN_EFFECT 135
+#define TENT_ALL_TASKS SIZE_MAX
+int tent_terminal_result(tent_engine_t engine, tent_batch_id_t batch_id,
+                          size_t task_id, int* status_code, int* effect_known);
+```
+
+The new query observes cached terminal evidence under the batch progress lock;
+it does not poll, dispatch, retry, or release resources. Use the existing status
+polls to progress the engine first. The return value is `0` for a terminal
+receipt, `-2` while pending, or `-1` for an invalid/freed batch or task. Outputs
+start at `135/0` on query failure. Successful outputs are a **positive** native
+code (zero for completed success), and `effect_known` as zero or one.
+
+TCP preserves every worker failure code before terminal publication. Its
+pre-dispatch connection/admission failures have a known unsent effect; an
+ambiguous data RPC retains `135/0` and suppresses failover. Other native failures
+keep their code without inventing certainty. Cancellation, timeout, and older
+backends without terminal evidence conservatively produce `135/0`. A later
+rejected attempt does not erase uncertainty from an earlier failover attempt.
+Merged aliases report the physical owner's evidence. For `TENT_ALL_TASKS`, all
+tasks must be terminal: 135 takes precedence over other errors, otherwise the
+first nonzero code in task order is returned; certainty is the AND of every
+task's result. A successful sibling may already have modified its destination.
+
+These are logical outcome receipts, **not physical drain receipts**. Neither
+an error code nor `effect_known` authorizes releasing an owned buffer or
+replaying a whole batch. The source and file physical-drain APIs still apply.
+OrbitKV can add this symbol to its FFI and classify native codes instead of
+assuming every `-1` is uncertain; no existing FFI signature or build flag changes
+are needed. C++ `TransferStatus` carries extra terminal evidence internally;
+C++ users must rebuild with this branch, while C `tent_status_t` is unchanged.
+
+Local validation used the same Debian trixie/aarch64 container, Linux
+6.12.76-linuxkit, GCC 14.4.0, with `--security-opt seccomp=unconfined` and the
+OrbitKV build flags listed above. The shared-library C gate passed 8/8 cases,
+then 50 repetitions (400 invocations, zero failures). The ABI gate passed,
+including all 23 original declarations/layouts and the new exported symbol.
+The unchanged full TCP suite passed 200 repetitions: 2,600 invocations, zero
+failures, including the payload-cap and registration-permission regressions.
+
+```sh
+cmake -S mooncake-transfer-engine -B .git/validation/build-linux \
+  -DBUILD_UNIT_TESTS=ON
+cmake --build .git/validation/build-linux --parallel 1 --target \
+  tent_orbitkv_c_status_test tent_orbitkv_abi_test tent_tcp_regression_test
+.git/validation/build-linux/tent/tests/tent_orbitkv_c_status_test --gtest_repeat=50
+.git/validation/build-linux/tent/tests/tent_orbitkv_abi_test
+.git/validation/build-linux/tent/tests/tent_tcp_regression_test --gtest_repeat=200
+```
+
+The C gate covers refusal before dispatch (134), EOF during descriptor lookup
+(135), both submit wrappers rejecting capacity (2), epoch validation, and
+EOF/reset/short-header/short-body after READ and WRITE dispatch. It checks
+request/connection counts to reject replay, stable task and aggregate receipts,
+merged aliases, success, pending, invalid/freed IDs, and conservative
+cancel/timeout evidence. Segment open remains lazy; lookup/epoch validation is
+what actually sends the descriptor RPC. Logs stay outside Git under
+`.git/validation/c-status/`. Scoped pre-commit passes.
+
+The hosted `orbitkv-integration.yml` gate also includes the new C test in its
+CPU leg. CUDA/cuFile checks remain compilation and injected controls; real
+GPU, RDMA and GDS profiles are not qualified here.
+
+Upstream main `4704c67f` has the same synchronous `Status` collapse. A separate
+`fix/tent-c-status-codes` branch carries only that shared correction, its header
+contract and generic C tests; it excludes this branch's epoch, file and
+terminal-effect additions.
 
 ## File I/O C API (OrbitKV patch)
 

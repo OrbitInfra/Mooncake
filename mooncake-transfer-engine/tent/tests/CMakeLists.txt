@@ -247,6 +247,16 @@ target_include_directories(tent_tcp_regression_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_regression_test COMMAND tent_tcp_regression_test)
 
+enable_language(C)
+add_executable(tent_orbitkv_c_status_test orbitkv_c_status_test.cpp
+                                          status_c_api_smoke.c)
+target_link_libraries(tent_orbitkv_c_status_test
+                      PRIVATE tent_shared tent_interface gtest gtest_main)
+if(TARGET asio_shared)
+  target_link_libraries(tent_orbitkv_c_status_test PRIVATE asio_shared)
+endif()
+add_test(NAME tent_orbitkv_c_status_test COMMAND tent_orbitkv_c_status_test)
+
 add_executable(tent_hp_tcp_transport_config_test
                hp_tcp_transport_config_test.cpp)
 target_link_libraries(tent_hp_tcp_transport_config_test
