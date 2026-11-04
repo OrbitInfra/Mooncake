@@ -50,7 +50,9 @@ All of these commits are ancestors of the selected release and remain present:
 
 OrbitKV's `crates/orbitkv-mooncake-sys/build.rs` configures the standalone transfer
 engine entry point, builds `tent_shared`, and stages `libtent_shared.so`,
-`libmooncake_common.so`, and `libasio.so`. Its flags are:
+`libmooncake_common.so`, and `libasio.so`. v0.3.14 also requires
+`tent/src/metrics/libtent_metrics.so` because upstream `904b8ab9` (#3797) made
+the metrics singleton shared, including when metrics are disabled. Its flags are:
 
 ```bash
 cmake -S mooncake-transfer-engine -B build-orbitkv -G Ninja \
@@ -69,7 +71,9 @@ CTest when tests are requested. Install `libcli11-dev` on Linux along with the
 normal TENT dependencies; no new consumer CMake flag is required.
 
 The maintained command builds the production target with unit tests disabled,
-then reconfigures the same build with `BUILD_UNIT_TESTS=ON`, builds the selected
+then stages all four libraries, sets `$ORIGIN` runpaths with `patchelf`, and
+checks that the relocated library loads without relying on build-directory
+runpaths. It then reconfigures with `BUILD_UNIT_TESTS=ON`, builds the selected
 tests, and runs CTest with per-case GoogleTest XML and CTest JUnit output:
 
 ```bash
@@ -88,22 +92,54 @@ the upstream real-GPU plugin test without claiming to run it on a GPU-less
 runner. `tent_orbitkv_abi_test` checks all 23 consumed C symbols, signatures, and
 64-bit struct layouts, and loads the built shared library with `RTLD_NOW`.
 
-[The fork workflow](.github/workflows/orbitkv-integration.yml) runs both Linux
-configurations and uploads configuration, build logs, CTest logs, and per-case
-XML. Inspect skipped GoogleTest cases as well as the CTest summary. Hardware
+[The fork workflow](.github/workflows/orbitkv-integration.yml) defines both Linux
+configurations and artifact uploads for configuration, build logs, CTest logs,
+and per-case XML. During this upgrade, GitHub rejected dispatch with HTTP 422,
+`Actions has been disabled for this repository`; no Actions job ran. The
+permissions endpoint nevertheless returned `enabled: true`. Local Linux
+containers supplied the results below. Inspect skipped GoogleTest cases as
+well as the CTest summary. Hardware
 RDMA, physical CUDA copies/context behavior, multi-GPU copies, and installed
 OrbitKV qualification remain separate hardware gates. A source-close receipt
 only proves whole-source CPU/TCP handler drain, not CUDA/RDMA physical drain or
 requester-batch retirement. Timeout or failed cleanup never authorizes reuse.
+
+### Observed validation
+
+Linux container: Debian trixie, aarch64, Linux 6.12.76-linuxkit, GCC 14.4.0,
+CMake 3.31.6. CUDA validation used NVIDIA's SHA-256-verified CUDA 13.0.2
+redistributions (nvcc 13.0.88, cudart 13.0.96) and driver stubs.
+
+| Check | Observed result |
+| --- | --- |
+| CPU production `tent_shared`, exact OrbitKV flags | Built; relocated four-library runtime loaded. |
+| Selected CPU tests | 19/19 CTest invocations passed. Three RDMA availability/hardware cases skipped. Docker's default syscall filter also skipped 20 io_uring cases, all rerun below. |
+| io_uring with `--security-opt seccomp=unconfined` | 24/24 GoogleTest cases passed, including in-flight I/O drain and failed-wait cleanup. |
+| CUDA production `tent_shared`, exact flags with `USE_CUDA=ON` | Built; relocated four-library runtime loaded. |
+| CUDA allocator ownership, upstream plugin context mocks, C ABI | 3/3 CTest invocations, 14/14 GoogleTest cases passed. |
+| `tent_cuda_plugin_context_gpu_test` | Built, not run: no physical GPU. |
+| macOS native configuration | Stopped at missing CLI11 development headers; no native macOS TENT binary built. |
+| Scoped pre-commit | Applicable checks passed. |
+
+Physical RDMA, CUDA device copies/context behavior, NVLink/multi-GPU execution,
+and x86_64 execution were not tested. GDS was not built because cuFile was
+absent. The full repository suite and OrbitKV's installed-runtime/Rust tests
+were not run; this session qualifies the selected TENT paths and leaves the
+OrbitKV pin unchanged. The old three-library runtime was also checked and
+failed to load with `libtent_metrics.so` missing, confirming the packaging
+change below.
 
 ## Consuming this branch
 
 In a separate OrbitKV session, update the submodule commit and branch metadata,
 then update `SOURCE_VERSION` and `SOURCE_REVISION` in `orbitkv-mooncake-sys` to
 match the reviewed new pin. Preserve all existing FFI signatures and layouts;
-no Rust FFI or CMake flag change is needed. Rebuild all three shared libraries
-from the new source together. Do not reuse a yalantinglibs override or build
-cache pinned to `7801bc9`; the release fetches the new pin automatically.
+no Rust FFI or CMake flag change is needed. Add
+`("tent/src/metrics/libtent_metrics.so", "libtent_metrics.so")` to `build.rs`'s
+`RUNTIME_LIBRARIES` and to any installed/prebuilt artifact manifests. Stage and
+rebuild all four shared libraries from the new source together. Do not reuse a
+yalantinglibs override or build cache pinned to `7801bc9`; the release fetches
+the new pin automatically.
 
 Peers must use the matching OrbitKV TENT wire contract. Do not mix this branch
 with stock upstream TCP peers, which lack the epoch envelope. Re-run OrbitKV's

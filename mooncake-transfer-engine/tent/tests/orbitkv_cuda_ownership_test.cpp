@@ -118,7 +118,9 @@ TEST_F(OrbitKvCudaOwnership, RestoresCustomAndAbsentContexts) {
         ASSERT_TRUE(platform.copy(destination, source, sizeof(source)).ok());
         EXPECT_EQ(std::memcmp(source, destination, sizeof(source)), 0);
         EXPECT_EQ(current_context, saved);
-        if (!bare) EXPECT_EQ(current_device, 0);
+        if (!bare) {
+            EXPECT_EQ(current_device, 0);
+        }
     }
 }
 

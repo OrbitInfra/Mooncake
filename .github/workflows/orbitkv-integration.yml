@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build libibverbs-dev libgoogle-glog-dev \
             libjsoncpp-dev libnuma-dev libyaml-cpp-dev libgflags-dev libssl-dev \
-            liburing-dev libfmt-dev libcli11-dev libunwind-dev python3-dev
+            liburing-dev libfmt-dev libcli11-dev libunwind-dev python3-dev patchelf
       - name: Install CUDA 13 toolkit for compile and injected tests
         if: matrix.cuda == 'ON'
         uses: Jimver/cuda-toolkit@v0.2.24

@@ -11,6 +11,25 @@ cmake -S mooncake-transfer-engine -B "$build_dir" -G Ninja \
   -DWITH_RUST_EXAMPLE=OFF -DUSE_HTTP=OFF -DUSE_ETCD=OFF -DUSE_REDIS=OFF \
   -DUSE_TENT=ON -DWITH_METRICS=OFF -DUSE_CUDA="$cuda"
 cmake --build "$build_dir" --target tent_shared --parallel "$jobs"
+# Match OrbitKV's relocated runtime directory. v0.3.14 adds tent_metrics as a
+# shared dependency even when metrics are disabled; keep the singleton shared.
+runtime_dir="$build_dir/orbitkv-runtime"
+mkdir -p "$runtime_dir"
+for library in tent/src/libtent_shared.so \
+               tent/src/metrics/libtent_metrics.so \
+               mooncake-common-src/libmooncake_common.so \
+               mooncake-common/libasio.so; do
+  destination="$runtime_dir/${library##*/}"
+  cp "$build_dir/$library" "$destination"
+  patchelf --set-rpath '$ORIGIN' "$destination"
+done
+python3 - "$runtime_dir/libtent_shared.so" <<'PY'
+import ctypes
+import sys
+
+ctypes.CDLL(sys.argv[1])
+print("OrbitKV relocated four-library runtime loads successfully", flush=True)
+PY
 cmake -S mooncake-transfer-engine -B "$build_dir" -DBUILD_UNIT_TESTS=ON
 if [[ "$cuda" == ON ]]; then
   targets=(tent_orbitkv_abi_test tent_orbitkv_cuda_ownership_test
