@@ -83,6 +83,7 @@ struct IOUringTask {
     Request request;
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
+    bool short_io{false};
     void *buffer = nullptr;
     // Set when `buffer` is a slot of this pool; keeps the pool alive until
     // the slot is returned. Null when `buffer` came from posix_memalign().
@@ -124,6 +125,9 @@ class IOUringTransport : public Transport {
     virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
 
     virtual Status freeSubBatch(SubBatchRef &batch);
+
+    Status openFile(int fd, FileRef &file) override;
+    bool fileTaskShortIO(SubBatchRef batch, int task_id) const override;
 
     virtual Status submitTransferTasks(
         SubBatchRef batch, const std::vector<Request> &request_list);

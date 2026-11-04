@@ -35,13 +35,22 @@ jobs:
           method: network
           sub-packages: '["nvcc", "cudart-dev", "nvrtc-dev", "driver-dev"]'
       - name: Build and test the OrbitKV configuration
+        # cuFile is compiled and exercised with injected status observations;
+        # this hosted runner has no GDS/GPU hardware.
         env:
           USE_CUDA: ${{ matrix.cuda }}
           BUILD_JOBS: '2'
         run: |
           if [[ "$USE_CUDA" == ON ]]; then
             sudo ln -sf libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-            export LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}"
+            curl --fail --location --retry 3 \
+              https://developer.download.nvidia.com/compute/cuda/redist/libcufile/linux-x86_64/libcufile-linux-x86_64-1.15.1.6-archive.tar.xz \
+              -o "$RUNNER_TEMP/cufile.tar.xz"
+            echo "2c1f544ab1b0e215590d943cbd1b0a192a066e9b7592e605c2e28b22e886688f  $RUNNER_TEMP/cufile.tar.xz" | sha256sum --check
+            export CUFILE_ROOT="$RUNNER_TEMP/cufile"
+            mkdir -p "$CUFILE_ROOT"
+            tar -xJf "$RUNNER_TEMP/cufile.tar.xz" --strip-components=1 -C "$CUFILE_ROOT"
+            export LD_LIBRARY_PATH="$CUFILE_ROOT/lib:/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}"
           fi
           set -o pipefail
           scripts/ci/run_orbitkv_tent_checks.sh build-orbitkv 2>&1 | tee orbitkv-native.log

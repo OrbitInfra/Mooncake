@@ -65,6 +65,103 @@ typedef struct tent_status tent_status_t;
 
 typedef void* tent_engine_t;
 
+/* OrbitKV file API. Additive; independent of the generic logical batch API. */
+typedef enum tent_file_error {
+    TENT_FILE_OK = 0,
+    TENT_FILE_INVALID_ARGUMENT = 1,
+    TENT_FILE_DISABLED = 2,
+    TENT_FILE_UNAVAILABLE = 3,
+    TENT_FILE_IO_ERROR = 4,
+    TENT_FILE_SHORT_IO = 5,
+    TENT_FILE_CANCELED = 6,
+    TENT_FILE_TIMEOUT = 7,
+    TENT_FILE_UNQUIESCED = 8,
+    TENT_FILE_BUSY = 9,
+    TENT_FILE_PERMISSION = 10
+} tent_file_error_t;
+
+typedef enum tent_gds_mode {
+    TENT_GDS_OFF = 0,
+    TENT_GDS_ON = 1,
+    TENT_GDS_NATIVE_ONLY = 2
+} tent_gds_mode_t;
+
+typedef enum tent_file_access {
+    TENT_FILE_READ = 1,
+    TENT_FILE_WRITE = 2,
+    TENT_FILE_READ_WRITE = 3
+} tent_file_access_t;
+
+typedef struct tent_file_options {
+    uint32_t struct_size;      /* sizeof(tent_file_options_t) */
+    uint32_t io_uring_enabled; /* 0 or 1 */
+    tent_gds_mode_t gds_mode;
+    uint32_t io_uring_queue_depth; /* 1..1024 when enabled */
+    uint32_t gds_queue_depth;      /* 1..1024 when enabled */
+} tent_file_options_t;
+
+typedef uint64_t tent_file_id_t;
+typedef uint64_t tent_file_batch_t;
+
+typedef struct tent_file_range {
+    void* address;
+    uint64_t length;
+} tent_file_range_t;
+
+/* Both callbacks must be nonthrowing, nonblocking, and must not reenter this
+ * file API. retain/release must own the actual backing, registrations and
+ * extent. Producer readiness and exclusive READ destinations are caller
+ * obligations. */
+typedef struct tent_file_owner {
+    void* context;
+    void (*retain)(void* context);
+    void (*release)(void* context);
+} tent_file_owner_t;
+
+typedef struct tent_file_result {
+    tent_file_error_t outcome;
+    uint32_t drained; /* 1 only after native I/O, staging and owner release */
+    uint64_t transferred_bytes; /* sum, not necessarily a contiguous prefix */
+} tent_file_result_t;
+
+/* Applies the existing thread-local settings, then overrides file transport
+ * enable/depth settings. Requested but unavailable transports fail creation. */
+int tent_create_engine_with_files(const tent_file_options_t* options,
+                                  tent_engine_t* engine);
+
+/* Existing regular files only; pins the inode. transport is IOURING or GDS.
+ * The returned handle belongs only to this API, not tent_open_segment(). */
+int tent_file_open(tent_engine_t engine, const char* uri,
+                   tent_file_access_t access, int transport,
+                   tent_file_id_t* file, uint64_t* length);
+
+/* Up to 16384 ranges / 64 MiB, mapped consecutively from file_offset.
+ * READ/WRITE use OPCODE_READ/WRITE. No extension, replay, fsync or atomicity.
+ * On success, retain has run and one batch owns the token until drained.
+ * On rejection, no I/O or callback has run and *batch is zero. */
+int tent_file_submit(tent_engine_t engine, tent_file_id_t file, int opcode,
+                     uint64_t file_offset, const tent_file_range_t* ranges,
+                     size_t count, const tent_file_owner_t* owner,
+                     tent_file_batch_t* batch);
+
+/* cancel != 0 closes dispatch of subsequent windows; the current window may
+ * finish. A timeout also closes dispatch. Neither is a physical receipt.
+ * Returns UNQUIESCED with drained=0 on timeout or uncertain cleanup; keep
+ * the engine and batch and retry drain (never resubmit a WRITE).
+ * On drained=1 returns outcome (OK, SHORT_IO, IO_ERROR, CANCELED or TIMEOUT).
+ * timeout_ms=0 polls once, without imposing a new operation deadline. */
+int tent_file_drain(tent_engine_t engine, tent_file_batch_t batch,
+                    uint64_t timeout_ms, int cancel,
+                    tent_file_result_t* result);
+int tent_file_release_batch(tent_engine_t engine, tent_file_batch_t batch);
+
+/* Closes admission, cancels future windows and drains all admitted batches.
+ * On UNQUIESCED the file/engine remain owned and close can be called again.
+ * A successful close releases the inode; batch receipts still need release.
+ * tent_destroy_engine retains an engine with any file handles or receipts. */
+int tent_file_close(tent_engine_t engine, tent_file_id_t file,
+                    uint64_t timeout_ms, tent_file_result_t* result);
+
 struct tent_buffer_info {
     uint64_t base, length;
     char location[64];

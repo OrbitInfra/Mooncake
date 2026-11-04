@@ -15,6 +15,7 @@ CUcontext current_context;
 int current_device, copies, device_queries;
 const void* device_pointer;
 bool fail_pointer, fail_switch, fail_copy, fail_sync, fail_restore;
+bool managed_pointer;
 int event_fd = -1;
 void event(char value) {
     if (event_fd >= 0) (void)write(event_fd, &value, 1);
@@ -28,6 +29,7 @@ class OrbitKvCudaOwnership : public testing::Test {
         fail_pointer = fail_switch = fail_copy = fail_sync = fail_restore =
             false;
         event_fd = -1;
+        managed_pointer = false;
     }
 };
 }  // namespace
@@ -45,6 +47,8 @@ CUresult __wrap_cuPointerGetAttributes(unsigned int count,
                 device ? CU_MEMORYTYPE_DEVICE : 0;
         else if (attrs[i] == CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL)
             *static_cast<int*>(values[i]) = device ? 2 : -1;
+        else if (attrs[i] == CU_POINTER_ATTRIBUTE_IS_MANAGED)
+            *static_cast<unsigned int*>(values[i]) = managed_pointer ? 1 : 0;
         else
             return CUDA_ERROR_INVALID_VALUE;
     }
@@ -122,6 +126,20 @@ TEST_F(OrbitKvCudaOwnership, RestoresCustomAndAbsentContexts) {
             EXPECT_EQ(current_device, 0);
         }
     }
+}
+
+TEST_F(OrbitKvCudaOwnership, NativeGdsRejectsManagedHostAndUnknownPointers) {
+    char data[8];
+    EXPECT_FALSE(mooncake::tent::nativeGdsDevicePointer(data));
+    device_pointer = data;
+    EXPECT_TRUE(mooncake::tent::nativeGdsDevicePointer(data));
+    managed_pointer = true;
+    EXPECT_FALSE(mooncake::tent::nativeGdsDevicePointer(data));
+    managed_pointer = false;
+    fail_pointer = true;
+    EXPECT_FALSE(mooncake::tent::nativeGdsDevicePointer(data));
+    EXPECT_EQ(copies, 0);
+    EXPECT_EQ(current_context, reinterpret_cast<CUcontext>(0x1234));
 }
 
 TEST_F(OrbitKvCudaOwnership, SwitchFailureStillRestoresExactContext) {

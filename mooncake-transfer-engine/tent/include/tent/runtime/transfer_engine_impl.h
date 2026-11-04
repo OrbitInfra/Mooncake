@@ -39,6 +39,8 @@
 #include "tent/runtime/transport_selector.h"
 #include "tent/runtime/hp_tcp_transport_config.h"
 
+struct tent_file_options;
+
 namespace mooncake {
 class TransferEngineImplTestPeer;
 namespace tent {
@@ -53,6 +55,7 @@ class SegmentTracker;
 class Platform;
 class ProxyManager;
 class ProgressWorker;
+class FileIO;
 
 // How long a poll loop should pause before polling again. Zero means poll
 // immediately.
@@ -274,6 +277,10 @@ class TransferEngineImpl {
 
    public:
     bool available() const { return available_; }
+
+    // C file API owner; configured once, before the engine is published.
+    int configureFileIO(const struct ::tent_file_options& options);
+    FileIO* fileIO() const { return file_io_.get(); }
 
     const std::string getSegmentName() const;
 
@@ -657,6 +664,7 @@ class TransferEngineImpl {
 
    private:
     std::shared_ptr<Config> conf_;
+    std::unique_ptr<FileIO> file_io_;
     HpTcpTransportConfig hp_tcp_transport_config_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;

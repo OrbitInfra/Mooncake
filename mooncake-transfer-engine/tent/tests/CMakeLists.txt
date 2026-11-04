@@ -337,6 +337,19 @@ add_test(NAME tent_shm_transport_test COMMAND tent_shm_transport_test)
 # restrictive seccomp profiles). Run in one process to exercise file context
 # isolation across live and retired transports.
 if(TARGET tent_xport_uring)
+  enable_language(C)
+  add_executable(tent_orbitkv_file_io_test orbitkv_file_io_test.cpp
+                                           file_c_api_smoke.c)
+  target_link_libraries(tent_orbitkv_file_io_test
+                        PRIVATE tent_shared tent_interface gtest gtest_main)
+  add_test(NAME tent_orbitkv_file_io_test COMMAND tent_orbitkv_file_io_test)
+  add_test(NAME tent_orbitkv_file_io_test_regular_fs
+           COMMAND tent_orbitkv_file_io_test)
+  set_tests_properties(tent_orbitkv_file_io_test PROPERTIES TIMEOUT 120)
+  set_tests_properties(
+    tent_orbitkv_file_io_test_regular_fs PROPERTIES TIMEOUT 120 ENVIRONMENT
+                                                    "TENT_FILE_TEST_DIR=/tmp")
+
   add_executable(tent_io_uring_transport_test io_uring_transport_test.cpp)
   target_link_libraries(tent_io_uring_transport_test PRIVATE gtest gtest_main
                                                              tent_link_group)
@@ -444,6 +457,7 @@ if(TARGET tent_xport_gds)
     tent_gds_transport_status_test
     PRIVATE
     "-Wl,--wrap=cuFileDriverOpen"
+    "-Wl,--wrap=cuFileDriverGetProperties"
     "-Wl,--wrap=cuFileBatchIOGetStatus"
     "-Wl,--wrap=cuFileBatchIOCancel"
     "-Wl,--wrap=cuFileBatchIOSubmit"
@@ -451,6 +465,12 @@ if(TARGET tent_xport_gds)
     "-Wl,--wrap=cuFileHandleDeregister"
     "-Wl,--wrap=cuFileBufRegister"
     "-Wl,--wrap=cuFileBufDeregister")
+  if(TENT_CUFILE_GET_PARAMETER)
+    target_compile_definitions(tent_gds_transport_status_test
+                               PRIVATE TENT_CUFILE_GET_PARAMETER)
+    target_link_options(tent_gds_transport_status_test PRIVATE
+                        "-Wl,--wrap=cuFileGetParameterBool")
+  endif()
   target_include_directories(tent_gds_transport_status_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_gds_transport_status_test

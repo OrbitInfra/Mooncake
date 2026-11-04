@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/runtime/file_io.h"
 #include "tent/runtime/control_plane.h"
 
 #include <algorithm>
@@ -316,6 +317,16 @@ TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
 }
 
 TransferEngineImpl::~TransferEngineImpl() { deconstruct(); }
+
+int TransferEngineImpl::configureFileIO(const tent_file_options_t& options) {
+    if (file_io_ || !FileIO::validOptions(options))
+        return TENT_FILE_INVALID_ARGUMENT;
+    auto files = std::make_unique<FileIO>(options, transport_list_[IOURING],
+                                          transport_list_[GDS]);
+    const int status = files->checkAvailable();
+    if (status == TENT_FILE_OK) file_io_ = std::move(files);
+    return status;
+}
 
 std::string randomSegmentName() {
     std::string name = "segment_noname_";

@@ -87,6 +87,10 @@ class GdsTransport : public Transport {
 
     virtual Status freeSubBatch(SubBatchRef& batch);
 
+    Status openFile(int fd, FileRef& file) override;
+    Status checkFileMode(bool native_only) override;
+    Status fileSliceSize(bool native_only, size_t& bytes) override;
+
     virtual Status submitTransferTasks(
         SubBatchRef batch, const std::vector<Request>& request_list);
 

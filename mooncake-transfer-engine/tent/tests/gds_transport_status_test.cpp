@@ -35,6 +35,9 @@ size_t failed_handle_register_count = 0;
 size_t batch_submit_call_count = 0;
 size_t buf_register_call_count = 0;
 size_t buf_deregister_call_count = 0;
+bool driver_available = true, allow_compat = false, force_compat = false;
+bool parameter_available = true;
+unsigned int buffer_cache_kb = 16 * 1024;
 
 }  // namespace
 
@@ -43,6 +46,32 @@ extern "C" CUfileError_t __wrap_cuFileDriverOpen() {
     result.err = CU_FILE_SUCCESS;
     return result;
 }
+
+extern "C" CUfileError_t __wrap_cuFileDriverGetProperties(
+    CUfileDrvProps_t* props) {
+    *props = {};
+    props->fflags =
+        static_cast<CUfileFeatureFlags_t>(1u << CU_FILE_BATCH_IO_SUPPORTED);
+    props->per_buffer_cache_size = buffer_cache_kb;
+    props->nvfs.max_direct_io_size = 16 * 1024;
+    props->nvfs.dcontrolflags =
+        allow_compat ? (1u << CU_FILE_ALLOW_COMPAT_MODE) : 0;
+    CUfileError_t result{};
+    result.err =
+        driver_available ? CU_FILE_SUCCESS : CU_FILE_DRIVER_NOT_INITIALIZED;
+    return result;
+}
+
+#ifdef TENT_CUFILE_GET_PARAMETER
+extern "C" CUfileError_t __wrap_cuFileGetParameterBool(
+    CUFileBoolConfigParameter_t param, bool* value) {
+    *value = param == CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE ? allow_compat
+                                                                : force_compat;
+    CUfileError_t result{};
+    result.err = parameter_available ? CU_FILE_SUCCESS : CU_FILE_INVALID_VALUE;
+    return result;
+}
+#endif
 
 extern "C" CUfileError_t __wrap_cuFileBatchIOGetStatus(CUfileBatchHandle_t,
                                                        unsigned,
@@ -133,6 +162,90 @@ class GdsTransportTestPeer {
 };
 
 namespace {
+
+TEST(GdsFileMode, MissingDriverIsUnavailable) {
+    GdsTransport transport;
+    driver_available = false;
+    EXPECT_FALSE(transport.checkFileMode(false).ok());
+    EXPECT_FALSE(transport.checkFileMode(true).ok());
+    driver_available = true;
+}
+
+TEST(GdsFileMode, NativeOnlyRejectsCompatibilityAndUnknownPolicy) {
+    GdsTransport transport;
+    allow_compat = true;
+    EXPECT_TRUE(transport.checkFileMode(false).ok());
+    EXPECT_FALSE(transport.checkFileMode(true).ok());
+    allow_compat = false;
+    force_compat = true;
+    EXPECT_FALSE(transport.checkFileMode(true).ok());
+    force_compat = false;
+    parameter_available = false;
+    EXPECT_FALSE(transport.checkFileMode(true).ok());
+    parameter_available = true;
+#ifdef TENT_CUFILE_GET_PARAMETER
+    EXPECT_TRUE(transport.checkFileMode(true).ok());
+#else
+    EXPECT_FALSE(transport.checkFileMode(true).ok());
+#endif
+}
+
+TEST(GdsFileMode, NativeSlicesDoNotExceedTheBounceCache) {
+    GdsTransport transport;
+    buffer_cache_kb = 1024;
+    size_t bytes = 0;
+    ASSERT_TRUE(transport.fileSliceSize(true, bytes).ok());
+    EXPECT_EQ(bytes, 1024u * 1024);
+    buffer_cache_kb = 0;
+    EXPECT_FALSE(transport.checkFileMode(true).ok());
+    EXPECT_FALSE(transport.fileSliceSize(true, bytes).ok());
+    buffer_cache_kb = 16 * 1024;
+}
+
+TEST(GdsFileMode, FileBatchKeepsRegisteredBaseAndInteriorOffset) {
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(metadata->segmentManager()
+                    .updateLocal([](SegmentDesc& desc) {
+                        desc.type = SegmentType::Memory;
+                        desc.detail = MemorySegmentDesc{};
+                        BufferDesc buffer;
+                        buffer.addr = 0x10000;
+                        buffer.length = 0x20000;
+                        buffer.transports.push_back(GDS);
+                        std::get<MemorySegmentDesc>(desc.detail)
+                            .buffers.push_back(buffer);
+                        return Status::OK();
+                    })
+                    .ok());
+    GdsTransport transport;
+    std::string name = "file-base-offset";
+    ASSERT_TRUE(
+        transport.install(name, metadata, nullptr, std::make_shared<Config>())
+            .ok());
+    char path[] = "/tmp/tent-gds-base-offset-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_GE(fd, 0);
+    Transport::FileRef file;
+    ASSERT_TRUE(transport.openFile(fd, file).ok());
+    GdsSubBatch batch;
+    BatchHandle handle{};
+    batch.batch_handle = &handle;
+    batch.file = file;
+    Request request;
+    request.source = reinterpret_cast<void*>(0x11000);
+    request.length = 8192;
+    request.target_offset = 4096;
+    request.opcode = Request::WRITE;
+    ASSERT_TRUE(transport.submitTransferTasks(&batch, {request}).ok());
+    ASSERT_EQ(batch.io_params.size(), 1);
+    EXPECT_EQ(batch.io_params[0].u.batch.devPtr_base,
+              reinterpret_cast<void*>(0x10000));
+    EXPECT_EQ(batch.io_params[0].u.batch.devPtr_offset, 4096);
+    EXPECT_EQ(batch.io_params[0].u.batch.file_offset, 4096);
+    EXPECT_EQ(batch.io_params[0].u.batch.size, 8192);
+    EXPECT_EQ(close(fd), 0);
+    EXPECT_EQ(unlink(path), 0);
+}
 
 CUfileIOEvents_t makeEvent(CUfileStatus_t status, int64_t bytes = 0,
                            size_t slice_id = 0) {

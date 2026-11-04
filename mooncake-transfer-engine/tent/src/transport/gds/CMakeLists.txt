@@ -6,6 +6,20 @@ if((CUDAToolkit_FOUND OR USE_XPU_GDS)
   add_library(tent_xport_gds STATIC ${TEV1_XPORT_GDS_SOURCES})
   target_include_directories(tent_xport_gds PUBLIC ${CUFILE_INCLUDE})
   target_link_libraries(tent_xport_gds PUBLIC tent_common ${CUFILE_LIB})
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${CUFILE_INCLUDE} ${CUDAToolkit_INCLUDE_DIRS})
+  set(CMAKE_REQUIRED_LIBRARIES ${CUFILE_LIB})
+  check_cxx_source_compiles(
+    "#include <cufile.h>
+     int main() { bool value = true;
+       cuFileGetParameterBool(CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE, &value);
+       cuFileGetParameterBool(CUFILE_PARAM_FORCE_COMPAT_MODE, &value); }"
+    TENT_CUFILE_GET_PARAMETER)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  unset(CMAKE_REQUIRED_LIBRARIES)
+  if(TENT_CUFILE_GET_PARAMETER)
+    target_compile_definitions(tent_xport_gds PRIVATE TENT_CUFILE_GET_PARAMETER)
+  endif()
   # The transport only calls cuFile; the CUDA runtime is linked for NVIDIA GDS
   # builds, not for the cuFile-compatible library used by USE_XPU_GDS.
   if(NOT USE_XPU_GDS)

@@ -320,12 +320,228 @@ The final TCP stress log has SHA-256
 Physical GPU, RDMA, and GDS behavior is not
 established by these CPU/socket tests or the hosted CUDA fault-injection leg.
 
+## File I/O C API (OrbitKV patch)
+
+OrbitKV #312 identified that the old initializer disabled both file transports
+and that generic batch status/free was not a physical-drain receipt. The new
+API drives TENT's IOURING/GDS sub-batches directly, with no transport failover or
+WRITE replay. It does not use OrbitKV's POSIX SSD byte-movement path. All 23
+existing OrbitKV C signatures and their struct layouts remain unchanged.
+
+The declarations below are additive in
+[`tent/transfer_engine.h`](mooncake-transfer-engine/tent/include/tent/transfer_engine.h).
+The header defines `tent_file_options_t` (struct size, io_uring enable, GDS mode,
+and the two queue depths), `tent_file_range_t` (address and length),
+`tent_file_owner_t` (context, retain and release callbacks), and
+`tent_file_result_t` (outcome, drained flag and transferred bytes).
+
+```c
+int tent_create_engine_with_files(const tent_file_options_t* options,
+                                  tent_engine_t* engine);
+int tent_file_open(tent_engine_t engine, const char* uri,
+                   tent_file_access_t access, int transport,
+                   tent_file_id_t* file, uint64_t* length);
+int tent_file_submit(tent_engine_t engine, tent_file_id_t file, int opcode,
+                     uint64_t file_offset, const tent_file_range_t* ranges,
+                     size_t count, const tent_file_owner_t* owner,
+                     tent_file_batch_t* batch);
+int tent_file_drain(tent_engine_t engine, tent_file_batch_t batch,
+                    uint64_t timeout_ms, int cancel,
+                    tent_file_result_t* result);
+int tent_file_release_batch(tent_engine_t engine, tent_file_batch_t batch);
+int tent_file_close(tent_engine_t engine, tent_file_id_t file,
+                    uint64_t timeout_ms, tent_file_result_t* result);
+```
+
+### Configuration and addressing
+
+Zero-initialize the options, set `struct_size = sizeof(tent_file_options_t)`,
+`io_uring_enabled` to 0 or 1, and `gds_mode` to `TENT_GDS_OFF`, `TENT_GDS_ON`, or
+`TENT_GDS_NATIVE_ONLY`. Each enabled transport requires a queue depth in
+1..1024. Creation snapshots the existing thread-local TENT settings and then
+overrides the file enable/depth settings; it does not mutate those settings.
+An enabled transport that was not built, cannot install, or lacks the required
+runtime returns `TENT_FILE_UNAVAILABLE` with a null engine. Disabled transports
+return `TENT_FILE_DISABLED` at file open; they never silently fall back.
+
+`tent_file_open` accepts an existing regular `file://` path, including
+`file:///proc/self/fd/N`, READ, WRITE, or READ_WRITE access, and an explicit
+`TRANSPORT_IOURING` or `TRANSPORT_GDS`. It pins that inode, returns its current
+length, and opens the native descriptor with the corresponding OS permissions.
+Unlinking/replacing the original path does not redirect an admitted operation.
+The file ID is engine-local and is not interchangeable with a generic segment
+ID. Files must already have their allocated length; submission rejects an
+out-of-bounds range or integer overflow before retaining a token or dispatching.
+A subsequent external truncation can still produce a short-read receipt.
+
+A vector maps its local ranges consecutively from `file_offset`. TENT expresses
+this as multiple physical requests, not one atomic vectored syscall. Requests
+are split at no more than 16 MiB and dispatched in windows of at most the selected queue
+depth. Completion bytes are the sum over ranges, **not a contiguous prefix**
+when a parallel window partially fails. A short READ copies back only bytes
+actually read and leaves the unread suffix unchanged. No partial WRITE is
+replayed, and no failed window is sent to another backend.
+
+Admission is bounded per engine: 256 open/opening/retained files, 32 live batch
+receipts, 16384 input ranges and 64 MiB per batch. Active and uncertain batches
+continue consuming their slot and byte allowance; even a completed receipt
+occupies its slot until `tent_file_release_batch`. There is one worker per
+admitted batch and at most one cleanup worker per closing file. File handles
+use explicit native owners, not the unbounded legacy file-descriptor caches.
+
+### Ownership, cancellation and physical drain
+
+The owner callbacks must retain the actual host/GPU backing, registrations,
+extent reservation, CUDA context when applicable, and admission charge. The
+caller grants immutable WRITE sources or exclusive READ destinations through
+physical drain, and establishes GPU producer readiness before submission.
+Callbacks must be nonthrowing and nonblocking, must not reenter the file API,
+and support
+execution on a worker thread; release cannot assume a caller CUDA context.
+Native registration cleanup remains the caller's responsibility and a failed
+unregister must retain its owner. The callback releases TENT's reference, not a
+promise that the caller's other references or registrations have been freed.
+
+A successful submit calls retain exactly once before dispatch. Rejection
+returns a zero batch ID and runs neither callback. The worker keeps the token,
+file, transport, staging buffers and native sub-batch through all admitted
+I/O. For IOURING it observes every CQE before entering #5068's sub-batch free;
+for GDS it waits for every slice to become terminal, including siblings of a
+failed slice. A handoff to GDS quarantine is never a physical-drain receipt.
+The io_uring path now checks both staging copy results; an uncertain CUDA copy
+retains its worker and owners under the existing fork copy contract.
+
+`cancel=1`, close, and a positive drain timeout stop admission of subsequent
+windows. The window already being dispatched may finish: this is best-effort
+logical cancellation, not a kernel cancellation receipt. `timeout_ms=0` only
+polls and does not impose a new deadline; positive values are bounded to one
+day. Drain and close do not wait indefinitely for a blocked provider, staging
+copy or file cleanup. They return `TENT_FILE_UNQUIESCED` with `drained=0` when physical
+termination has not been proved. The batch, engine and file stay owned and
+charged. Polling completion again is allowed; **resubmitting the WRITE is not**.
+A failed native cleanup is retained permanently and is never attempted twice.
+
+After every I/O and staging operation has finished, sub-batch cleanup succeeds,
+and release has returned, drain reports `drained=1`. Its return code equals the
+logical outcome: `OK`, `SHORT_IO`, `IO_ERROR`, `CANCELED`, or `TIMEOUT` (all have
+the `TENT_FILE_` prefix). A deadline can therefore be followed by a drained
+TIMEOUT receipt. Before drain, an OK outcome means only that no error has yet
+been observed; it is not completion. Pre-admission errors additionally include
+`INVALID_ARGUMENT`, `PERMISSION`, `DISABLED`, `UNAVAILABLE`, and `BUSY`.
+
+Close first closes file admission, requests logical cancellation, and drains
+all its batches within one shared deadline. It then closes the native file
+owner on a bounded cleanup worker. Only a successful close reports the file
+released; failed/uncertain close retains the handle and supports later
+observation without retrying a possibly partial cleanup. Individual batch
+receipts remain available until explicitly released. `tent_destroy_engine`
+retains an engine with any outstanding file handles or batch receipts instead
+of deleting it. Close/release all of them before destroying the engine. As for
+the original C API, callers must keep the engine alive through concurrent API
+calls and serialize engine destruction.
+
+The existing `tent_close_source` proof remains restricted to CPU TCP-only
+engines. Enabling file transports does **not** upgrade that proof: it still
+returns unsupported. OrbitKV should create a separate engine for file I/O,
+leaving its current network engine and epoch/grant fencing intact.
+
+### CUDA and GDS limits
+
+IOURING supports host buffers and TENT's CUDA-through-host-staging path. GDS ON
+uses cuFile's configured routing, which may include compatibility I/O. GDS
+NATIVE_ONLY fails closed unless live cuFile queries prove both
+`allow_compat_mode` and `force_compat_mode` disabled, and batch I/O is available.
+It currently accepts only local ext4/XFS files and 4 KiB-aligned NVIDIA device
+addresses, lengths and offsets; managed and host memory are rejected. Native-only slices are also capped by the live
+cuFile bounce-cache and direct-I/O limits, because an oversized batch slice can
+otherwise take compatibility I/O. Interior ranges of memory registered with
+this engine preserve cuFile's registered base plus buffer offset. Make GDS
+registrations through the file engine; registrations made externally to TENT
+are outside this API's supported registration contract. Older SDKs without the policy-query API return
+unavailable for this mode. No process-global CUDA/cuFile configuration is
+changed. This checks policy; native-route qualification still requires hardware
+and route evidence, as described in the
+[NVIDIA cuFile reference](https://docs.nvidia.com/gpudirect-storage/api-reference-guide/).
+GDS open/submit require a current CUDA context; retain the opening context until
+file close and the submitting context in each batch token until drain.
+
+This API covers OrbitKV's preallocated shard files, retained exact inode,
+scatter/gather byte movement, read/write permissions, deadline/cancel and
+physical-drain receipts. It does not create/extend shards, allocate extents,
+encode records, publish indexes, provide fsync durability, make a vector atomic,
+or do OrbitKV's GPU gather/scatter kernels. Those remain consumer work. A
+separate OrbitKV change must add the new FFI/types, retain/release token bridge,
+file-engine configuration and receipt mapping; every non-drained result maps
+to `Unquiesced`, and WRITE publication requires a full-byte drained success.
+
+### File API validation
+
+The real-file C boundary gate is `tent_orbitkv_file_io_test`; it links the
+shared library and includes a translation unit compiled as C. It requires
+working io_uring and fails instead of silently skipping a blocked kernel.
+It covers byte-checked vector round trips, permission/overflow rejection,
+short reads and EOF with unchanged suffixes, cancel and deadline drain,
+retained actual backing after a lost completion, capacity retention, inode
+replacement, delayed file close, and non-retried failed cleanup.
+
+Final local results on the same Debian trixie aarch64 image, Linux
+6.12.76-linuxkit, GCC 14.4.0, and CMake 3.31.6:
+
+| Gate | Result |
+| --- | --- |
+| CPU production/relocated-library/ABI and selected TENT tests | 21/21 CTest invocations passed; 488 GoogleTest case invocations passed, three RDMA availability/hardware cases skipped. |
+| File C API, real io_uring | 14/14 cases on tmpfs and 14/14 on the regular container filesystem (`/tmp`); no skips. |
+| CUDA 13.0.2 + cuFile 1.15.1.6 build and injected controls | 4/4 CTest invocations, 33/33 cases passed. Includes 18 GDS policy/completion controls and managed-memory rejection; no GPU I/O is claimed. |
+| Full TCP regression stress | 200 repetitions, 2600/2600 case invocations passed, zero failures. |
+| Scoped pre-commit, clang-format 20.1.8, CMake format, diff check | Passed. |
+
+The CPU commands were:
+
+```bash
+docker run --rm --security-opt seccomp=unconfined \
+  --mount "type=bind,source=$PWD,target=/workspace" -w /workspace \
+  orbitinfra-mooncake-validation:v0314 bash -c '
+    apt-get update -qq && apt-get install -y -qq patchelf &&
+    USE_CUDA=OFF BUILD_JOBS=2 scripts/ci/run_orbitkv_tent_checks.sh .git/validation/build-linux &&
+    .git/validation/build-linux/tent/tests/tent_tcp_regression_test --gtest_repeat=200
+  '
+```
+
+The CUDA build used the existing CUDA 13.0.2 toolkit and driver stubs under
+`.git/validation/cuda-redist`, plus the NVIDIA cuFile 1.15.1.6 aarch64 archive:
+
+```bash
+docker run --rm --security-opt seccomp=unconfined \
+  --mount "type=bind,source=$PWD,target=/workspace" -w /workspace \
+  orbitinfra-mooncake-validation:v0314 bash -c '
+    apt-get update -qq && apt-get install -y -qq patchelf &&
+    export CUFILE_ROOT=/workspace/.git/validation/file-io/libcufile-linux-sbsa-1.15.1.6-archive &&
+    export LD_LIBRARY_PATH=$CUFILE_ROOT/lib:/workspace/.git/validation/cuda-redist/lib/stubs:/workspace/.git/validation/cuda-redist/lib &&
+    USE_CUDA=ON BUILD_JOBS=2 scripts/ci/run_orbitkv_tent_checks.sh .git/validation/build-linux-cuda
+  '
+```
+
+The maintained fork workflow runs the same CPU gate on x86-64 Linux and now
+also compiles cuFile/GDS and runs its injected controls on the CUDA leg. Its
+NVIDIA archive is pinned by SHA-256. GDS-enabled builds retain upstream's
+link-time cuFile dependency: cuFile must be installed even if a particular
+engine disables GDS. No new dependency is needed for an IOURING-only build.
+
+Raw logs and XML stay in `.git/validation/file-io/`, outside Git:
+`final-cpu.log`, `final-cuda.log`, `final-tcp-200.log`, `pre-commit.log`, and
+`results.json`. The final TCP log SHA-256 is
+`a80554f2f891909b3dd3981b721a7ccd0529a43fd6a2e0701dd64e12ec0409e9`.
+GPU staging and native GDS are source/compile and injected-control coverage
+only until installed hardware gates run; this patch makes no GPU, RDMA or GDS
+hardware claim.
+
 ## Consuming this branch
 
 In a separate OrbitKV session, update the submodule commit and branch metadata,
 then update `SOURCE_VERSION` and `SOURCE_REVISION` in `orbitkv-mooncake-sys` to
 match the reviewed new pin. Preserve all existing FFI signatures and layouts;
-no Rust FFI or CMake flag change is needed. Add
+existing network FFI needs no signature change. The file API requires the
+additive FFI and consumer integration described above. Add
 `("tent/src/metrics/libtent_metrics.so", "libtent_metrics.so")` to `build.rs`'s
 `RUNTIME_LIBRARIES` and to any installed/prebuilt artifact manifests. Stage and
 rebuild all four shared libraries from the new source together. Do not reuse a

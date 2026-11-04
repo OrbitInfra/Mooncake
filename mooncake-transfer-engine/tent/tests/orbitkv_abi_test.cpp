@@ -55,18 +55,21 @@ TEST(OrbitKvAbi, SharedLibraryExportsEveryConsumedSymbol) {
     void* library = dlopen(TENT_SHARED_PATH, RTLD_NOW | RTLD_LOCAL);
     ASSERT_NE(library, nullptr) << dlerror();
     for (const char* name :
-         {"tent_set_config",        "tent_create_engine",
-          "tent_destroy_engine",    "tent_available",
-          "tent_segment_name",      "tent_open_segment",
-          "tent_close_segment",     "tent_register_memory_ex",
-          "tent_unregister_memory", "tent_close_source",
-          "tent_source_epoch",      "tent_validate_remote_epoch",
-          "tent_allocate_batch",    "tent_submit",
-          "tent_submit_notif",      "tent_task_status",
-          "tent_overall_status",    "tent_cancel_task",
-          "tent_free_batch",        "tent_recv_notifs",
-          "tent_free_notifs",       "tent_send_notifs",
-          "tent_get_nic_load_stats"}) {
+         {"tent_set_config",         "tent_create_engine",
+          "tent_destroy_engine",     "tent_available",
+          "tent_segment_name",       "tent_open_segment",
+          "tent_close_segment",      "tent_register_memory_ex",
+          "tent_unregister_memory",  "tent_close_source",
+          "tent_source_epoch",       "tent_validate_remote_epoch",
+          "tent_allocate_batch",     "tent_submit",
+          "tent_submit_notif",       "tent_task_status",
+          "tent_overall_status",     "tent_cancel_task",
+          "tent_free_batch",         "tent_recv_notifs",
+          "tent_free_notifs",        "tent_send_notifs",
+          "tent_get_nic_load_stats", "tent_create_engine_with_files",
+          "tent_file_open",          "tent_file_submit",
+          "tent_file_drain",         "tent_file_release_batch",
+          "tent_file_close"}) {
         EXPECT_NE(dlsym(library, name), nullptr) << name;
     }
     EXPECT_EQ(dlclose(library), 0);

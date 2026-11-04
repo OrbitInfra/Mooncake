@@ -46,6 +46,12 @@ struct Capabilities {
 
 class Transport {
    public:
+    // Explicit local files pin one inode independently of descriptor caches.
+    struct File {
+        virtual ~File() = default;
+    };
+    using FileRef = std::shared_ptr<File>;
+
     struct SubBatch {
         SubBatch() : device_mask(~0ULL) {}
         virtual ~SubBatch() {}
@@ -63,6 +69,7 @@ class Transport {
         std::string qp_pool;
         BatchID progress_batch_id{0};
         std::function<void(BatchID)> notify_progress;
+        FileRef file;
     };
 
     using SubBatchRef = SubBatch*;
@@ -85,6 +92,29 @@ class Transport {
     // transports have no background work; transports with async I/O use this
     // barrier to settle work while their buffer registry is still alive.
     virtual Status quiesce() { return Status::OK(); }
+
+    virtual Status openFile(int fd, FileRef& file) {
+        return Status::NotImplemented("Explicit file ownership unavailable");
+    }
+
+    virtual Status closeFile(FileRef& file) {
+        file.reset();
+        return Status::OK();
+    }
+
+    virtual Status checkFileMode(bool native_only) {
+        return native_only ? Status::NotImplemented("Native-only unavailable")
+                           : Status::OK();
+    }
+
+    virtual Status fileSliceSize(bool native_only, size_t& bytes) {
+        bytes = 16ull << 20;
+        return Status::OK();
+    }
+
+    virtual bool fileTaskShortIO(SubBatchRef batch, int task_id) const {
+        return false;
+    }
 
     virtual const Capabilities capabilities() const { return caps; }
 

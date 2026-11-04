@@ -31,10 +31,10 @@
 
 namespace mooncake {
 namespace tent {
-class GdsFileContext {
+class GdsFileContext : public Transport::File {
    public:
-    explicit GdsFileContext(const std::string& path) {
-        fd_ = open(path.c_str(), O_RDWR | O_DIRECT);
+    explicit GdsFileContext(const std::string& path, int access = O_RDWR) {
+        fd_ = open(path.c_str(), access | O_DIRECT | O_CLOEXEC);
         if (fd_ < 0) {
             PLOG(ERROR) << "Failed to open file " << path;
             return;
@@ -250,6 +250,61 @@ GdsTransport::GdsTransport() : installed_(false) {
 }
 
 GdsTransport::~GdsTransport() { uninstall(); }
+
+Status GdsTransport::checkFileMode(bool native_only) {
+    CUfileDrvProps_t props{};
+    auto status = cuFileDriverGetProperties(&props);
+    if (status.err != CU_FILE_SUCCESS)
+        return Status::NotImplemented("cuFile driver unavailable");
+    if (!(static_cast<unsigned>(props.fflags) &
+          (1u << CU_FILE_BATCH_IO_SUPPORTED)))
+        return Status::NotImplemented("cuFile batch I/O unavailable");
+    if (!native_only) return Status::OK();
+    if (props.per_buffer_cache_size < 4 || props.nvfs.max_direct_io_size < 4)
+        return Status::NotImplemented("Native cuFile slice limits unavailable");
+#ifdef TENT_CUFILE_GET_PARAMETER
+    bool allow_compat = true, force_compat = true;
+    auto allow = cuFileGetParameterBool(
+        CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE, &allow_compat);
+    auto force =
+        cuFileGetParameterBool(CUFILE_PARAM_FORCE_COMPAT_MODE, &force_compat);
+    if (allow.err == CU_FILE_SUCCESS && force.err == CU_FILE_SUCCESS &&
+        !allow_compat && !force_compat &&
+        !(props.nvfs.dcontrolflags & (1u << CU_FILE_ALLOW_COMPAT_MODE)))
+        return Status::OK();
+#endif
+    // Never change process-global cuFile settings on behalf of one engine.
+    return Status::NotImplemented(
+        "Native-only requires queryable cuFile runtime with allow/force "
+        "compatibility both disabled");
+}
+
+Status GdsTransport::fileSliceSize(bool native_only, size_t& bytes) {
+    bytes = 16ull << 20;
+    if (!native_only) return Status::OK();
+    CUfileDrvProps_t props{};
+    auto status = cuFileDriverGetProperties(&props);
+    if (status.err != CU_FILE_SUCCESS || props.per_buffer_cache_size < 4 ||
+        props.nvfs.max_direct_io_size < 4)
+        return Status::NotImplemented("Native cuFile slice limits unavailable");
+    // cuFile batch I/O larger than the bounce cache can use compatibility
+    // I/O even when allow_compat_mode is false. Both properties are in KiB.
+    bytes = std::min({size_t{16 * 1024}, size_t{props.per_buffer_cache_size},
+                      props.nvfs.max_direct_io_size}) /
+            4 * 4096;
+    return Status::OK();
+}
+
+Status GdsTransport::openFile(int fd, FileRef& file) {
+    const int flags = fcntl(fd, F_GETFL);
+    if (flags < 0) return Status::InvalidArgument("Invalid file descriptor");
+    auto context = std::make_shared<GdsFileContext>(
+        "/proc/self/fd/" + std::to_string(fd), flags & O_ACCMODE);
+    if (!context->ready())
+        return Status::InternalError("Cannot register GDS file");
+    file = std::move(context);
+    return Status::OK();
+}
 
 Status GdsTransport::install(std::string& local_segment_name,
                              std::shared_ptr<ControlService> metadata,
@@ -484,10 +539,31 @@ Status GdsTransport::submitTransferTasks(
     if (first_param_index + num_params > io_batch_depth_)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
     for (auto& request : request_list) {
-        auto context = findFileContext(request.target_id);
+        auto context =
+            batch->file ? std::dynamic_pointer_cast<GdsFileContext>(batch->file)
+                        : findFileContext(request.target_id);
         if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
         gds_batch->file_contexts.push_back(context);
+        void* buffer_base = request.source;
+        size_t buffer_offset = 0;
+        if (batch->file && metadata_) {
+            // cuFile requires the registered base plus an offset, not an
+            // interior pointer masquerading as a separately registered base.
+            auto local = metadata_->segmentManager().getLocal();
+            auto* buffer = local
+                               ? local->findBuffer(
+                                     reinterpret_cast<uint64_t>(request.source),
+                                     request.length)
+                               : nullptr;
+            if (buffer &&
+                std::find(buffer->transports.begin(), buffer->transports.end(),
+                          GDS) != buffer->transports.end()) {
+                buffer_base = reinterpret_cast<void*>(buffer->addr);
+                buffer_offset =
+                    reinterpret_cast<uint64_t>(request.source) - buffer->addr;
+            }
+        }
         IOParamRange range;
         range.base = gds_batch->io_params.size();
         for (size_t offset = 0; offset < request.length;
@@ -502,8 +578,8 @@ Status GdsTransport::submitTransferTasks(
             // independently, including the first slice (cookie 0 is avoided).
             params.cookie = reinterpret_cast<void*>(
                 static_cast<std::uintptr_t>(slice_id + 1));
-            params.u.batch.devPtr_base = request.source;
-            params.u.batch.devPtr_offset = offset;
+            params.u.batch.devPtr_base = buffer_base;
+            params.u.batch.devPtr_offset = buffer_offset + offset;
             params.u.batch.file_offset = request.target_offset + offset;
             params.u.batch.size = length;
             params.fh = context->getHandle();

@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/runtime/file_io.h"
 
 #define CAST(ptr) ((mooncake::tent::TransferEngineImpl*)ptr)
 #define CHECK_POINTER(ptr)                       \
@@ -55,7 +56,110 @@ tent_engine_t tent_create_engine() {
 
 void tent_destroy_engine(tent_engine_t engine) {
     if (engine) {
+        if (CAST(engine)->fileIO() && CAST(engine)->fileIO()->hasOwners()) {
+            LOG(ERROR)
+                << "tent_destroy_engine: retaining engine with file "
+                   "handles or batch receipts; close/drain/release first";
+            return;
+        }
         delete CAST(engine);
+    }
+}
+
+int tent_create_engine_with_files(const tent_file_options_t* options,
+                                  tent_engine_t* engine) {
+    if (!engine) return TENT_FILE_INVALID_ARGUMENT;
+    *engine = nullptr;
+    if (!options || !mooncake::tent::FileIO::validOptions(*options))
+        return TENT_FILE_INVALID_ARGUMENT;
+    try {
+        auto config = std::make_shared<mooncake::tent::Config>();
+        if (!tl_settings.path.empty() && !config->load(tl_settings.path).ok())
+            return TENT_FILE_INVALID_ARGUMENT;
+        for (auto& attr : tl_settings.attrs)
+            config->setFromString(attr.first, attr.second);
+        config->set("transports/io_uring/enable",
+                    options->io_uring_enabled != 0);
+        config->set("transports/gds/enable", options->gds_mode != TENT_GDS_OFF);
+        config->set("transports/gds/io_batch_depth", options->gds_queue_depth);
+        auto created =
+            std::make_unique<mooncake::tent::TransferEngineImpl>(config);
+        if (!created->available()) return TENT_FILE_UNAVAILABLE;
+        const int status = created->configureFileIO(*options);
+        if (status != TENT_FILE_OK) return status;
+        *engine = created.release();
+        return TENT_FILE_OK;
+    } catch (...) {
+        return TENT_FILE_UNAVAILABLE;
+    }
+}
+
+int tent_file_open(tent_engine_t engine, const char* uri,
+                   tent_file_access_t access, int transport,
+                   tent_file_id_t* file, uint64_t* length) {
+    if (file) *file = 0;
+    if (length) *length = 0;
+    if (!engine || !file || !length) return TENT_FILE_INVALID_ARGUMENT;
+    if (!CAST(engine)->fileIO()) return TENT_FILE_DISABLED;
+    try {
+        return CAST(engine)->fileIO()->open(uri, access, transport, *file,
+                                            *length);
+    } catch (...) {
+        return TENT_FILE_IO_ERROR;
+    }
+}
+
+int tent_file_submit(tent_engine_t engine, tent_file_id_t file, int opcode,
+                     uint64_t file_offset, const tent_file_range_t* ranges,
+                     size_t count, const tent_file_owner_t* owner,
+                     tent_file_batch_t* batch) {
+    if (batch) *batch = 0;
+    if (!engine || !batch || !owner) return TENT_FILE_INVALID_ARGUMENT;
+    if (!CAST(engine)->fileIO()) return TENT_FILE_DISABLED;
+    try {
+        return CAST(engine)->fileIO()->submit(file, opcode, file_offset, ranges,
+                                              count, *owner, *batch);
+    } catch (...) {
+        return TENT_FILE_IO_ERROR;
+    }
+}
+
+int tent_file_drain(tent_engine_t engine, tent_file_batch_t batch,
+                    uint64_t timeout_ms, int cancel,
+                    tent_file_result_t* result) {
+    if (!result) return TENT_FILE_INVALID_ARGUMENT;
+    *result = {TENT_FILE_UNQUIESCED, 0, 0};
+    if (!engine || (cancel != 0 && cancel != 1))
+        return TENT_FILE_INVALID_ARGUMENT;
+    if (!CAST(engine)->fileIO()) return TENT_FILE_DISABLED;
+    try {
+        return CAST(engine)->fileIO()->drain(batch, timeout_ms, cancel != 0,
+                                             *result);
+    } catch (...) {
+        return TENT_FILE_UNQUIESCED;
+    }
+}
+
+int tent_file_release_batch(tent_engine_t engine, tent_file_batch_t batch) {
+    if (!engine) return TENT_FILE_INVALID_ARGUMENT;
+    if (!CAST(engine)->fileIO()) return TENT_FILE_DISABLED;
+    try {
+        return CAST(engine)->fileIO()->release(batch);
+    } catch (...) {
+        return TENT_FILE_UNQUIESCED;
+    }
+}
+
+int tent_file_close(tent_engine_t engine, tent_file_id_t file,
+                    uint64_t timeout_ms, tent_file_result_t* result) {
+    if (!result) return TENT_FILE_INVALID_ARGUMENT;
+    *result = {TENT_FILE_UNQUIESCED, 0, 0};
+    if (!engine) return TENT_FILE_INVALID_ARGUMENT;
+    if (!CAST(engine)->fileIO()) return TENT_FILE_DISABLED;
+    try {
+        return CAST(engine)->fileIO()->close(file, timeout_ms, *result);
+    } catch (...) {
+        return TENT_FILE_UNQUIESCED;
     }
 }
 

@@ -49,6 +49,20 @@ inline int getCudaDeviceForPtr(const void* ptr) {
     return static_cast<int>(dev_ordinal);
 }
 
+// Native-only GDS accepts device allocations, never managed/host pointers.
+// Query failure is unavailable, not permission to take a compatibility path.
+inline bool nativeGdsDevicePointer(const void* ptr) {
+    if (!ptr || !ensureCudaDriverInit()) return false;
+    unsigned int type = 0, managed = 1;
+    CUpointer_attribute attributes[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                                        CU_POINTER_ATTRIBUTE_IS_MANAGED};
+    void* values[] = {&type, &managed};
+    return cuPointerGetAttributes(2, attributes, values,
+                                  reinterpret_cast<CUdeviceptr>(ptr)) ==
+               CUDA_SUCCESS &&
+           type == CU_MEMORYTYPE_DEVICE && managed == 0;
+}
+
 // The multi-attribute API returns zero attributes successfully for ordinary
 // unregistered host pointers. Unlike the single-attribute API, no query error
 // is interpreted as host memory.

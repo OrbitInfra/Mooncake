@@ -32,16 +32,17 @@
 
 namespace mooncake {
 namespace tent {
-class IOUringFileContext {
+class IOUringFileContext : public Transport::File {
    public:
-    explicit IOUringFileContext(const std::string& path) : ready_(false) {
-        fd_ = open(path.c_str(), O_RDWR | O_DIRECT);
+    explicit IOUringFileContext(const std::string& path, int access = O_RDWR)
+        : ready_(false) {
+        fd_ = open(path.c_str(), access | O_DIRECT | O_CLOEXEC);
         if (fd_ >= 0) {
             ready_ = true;
             return;
         }
 
-        fd_ = open(path.c_str(), O_RDWR);
+        fd_ = open(path.c_str(), access | O_CLOEXEC);
         if (fd_ < 0) {
             PLOG(ERROR) << "Failed to open file " << path;
             return;
@@ -181,6 +182,23 @@ static std::shared_ptr<IOUringStagingPool> createStagingPool(
 IOUringTransport::IOUringTransport() : installed_(false) {}
 
 IOUringTransport::~IOUringTransport() { uninstall(); }
+
+Status IOUringTransport::openFile(int fd, FileRef& file) {
+    const int flags = fcntl(fd, F_GETFL);
+    if (flags < 0) return Status::InvalidArgument("Invalid file descriptor");
+    auto context = std::make_shared<IOUringFileContext>(
+        "/proc/self/fd/" + std::to_string(fd), flags & O_ACCMODE);
+    if (!context->ready()) return Status::InternalError("Cannot open file");
+    file = std::move(context);
+    return Status::OK();
+}
+
+bool IOUringTransport::fileTaskShortIO(SubBatchRef batch, int task_id) const {
+    auto* native = dynamic_cast<IOUringSubBatch*>(batch);
+    return native && task_id >= 0 &&
+           static_cast<size_t>(task_id) < native->task_list.size() &&
+           native->task_list[task_id].short_io;
+}
 
 Status IOUringTransport::install(std::string& local_segment_name,
                                  std::shared_ptr<ControlService> metadata,
@@ -357,7 +375,9 @@ Status IOUringTransport::submitTransferTasks(
             return Status::InvalidArgument("Unsupported opcode" LOC_MARK);
         }
 
-        IOUringFileContext* context = findFileContext(request.target_id);
+        auto* context =
+            batch->file ? dynamic_cast<IOUringFileContext*>(batch->file.get())
+                        : findFileContext(request.target_id);
         if (!context || !context->ready()) {
             releaseStagingBuffers(staging_pool_.get(), staging_buffers);
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
@@ -389,6 +409,20 @@ Status IOUringTransport::submitTransferTasks(
         return Status::TooManyRequests("Insufficient SQE space" LOC_MARK);
     }
 
+    // Stage WRITEs before committing any SQE. Platform::copy returns only
+    // after quiescence; its CUDA owner retains on uncertain completion.
+    for (size_t i = 0; i < request_list.size(); ++i) {
+        if (staging_buffers[i] && request_list[i].opcode == Request::WRITE) {
+            auto status = Platform::getLoader().copy(staging_buffers[i],
+                                                     request_list[i].source,
+                                                     request_list[i].length);
+            if (!status.ok()) {
+                releaseStagingBuffers(staging_pool_.get(), staging_buffers);
+                return status;
+            }
+        }
+    }
+
     // Phase 2: commit. Tasks are appended and SQEs prepared; from here on
     // this call must not return an error. A positive short io_uring_submit()
     // means part of the batch is already in flight, and an error return
@@ -403,6 +437,7 @@ Status IOUringTransport::submitTransferTasks(
             io_uring_batch->task_list[io_uring_batch->task_list.size() - 1];
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
+        task.transferred_bytes = 0;
         task.buffer = staging_buffers[i];
         if (staging_pool_ && staging_pool_->owns(task.buffer))
             task.pool = staging_pool_;
@@ -419,9 +454,6 @@ Status IOUringTransport::submitTransferTasks(
             io_uring_prep_readv(sqe, contexts[i]->getHandle(), &task.iov, 1,
                                 request.target_offset);
         } else {
-            if (task.buffer)
-                Platform::getLoader().copy(task.buffer, request.source,
-                                           request.length);
             io_uring_prep_writev(sqe, contexts[i]->getHandle(), &task.iov, 1,
                                  request.target_offset);
         }
@@ -475,15 +507,20 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
                 const size_t completed_bytes = static_cast<size_t>(cqe->res);
                 // A nonnegative CQE may still be short, including EOF. Only
                 // copy the prefix actually read from the file.
+                Status copy_status;
                 if (cqe_task->buffer && completed_bytes != 0 &&
                     cqe_task->request.opcode == Request::READ) {
-                    Platform::getLoader().copy(cqe_task->request.source,
-                                               cqe_task->buffer,
-                                               completed_bytes);
+                    copy_status = Platform::getLoader().copy(
+                        cqe_task->request.source, cqe_task->buffer,
+                        completed_bytes);
                 }
-                cqe_task->transferred_bytes = completed_bytes;
+                cqe_task->transferred_bytes =
+                    copy_status.ok() ? completed_bytes : 0;
+                cqe_task->short_io = copy_status.ok() &&
+                                     completed_bytes < cqe_task->request.length;
                 cqe_task->status_word =
-                    completed_bytes == cqe_task->request.length
+                    copy_status.ok() &&
+                            completed_bytes == cqe_task->request.length
                         ? TransferStatusEnum::COMPLETED
                         : TransferStatusEnum::FAILED;
             }
