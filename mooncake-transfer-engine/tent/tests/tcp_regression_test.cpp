@@ -131,6 +131,9 @@ class TcpRegression : public testing::Test {
         config->set("transports/tcp/enable", true);
         config->set("transports/rdma/enable", false);
         config->set("transports/shm/enable", false);
+        // A source-drain receipt requires a TCP-only engine. io_uring is
+        // otherwise loaded by default when the host kernel supports it.
+        config->set("transports/io_uring/enable", false);
         config->set("transports/tcp/max_concurrent_tasks", 1);
         config->set("transports/tcp/max_retry_count", 0);
         engine = std::make_unique<TransferEngineImpl>(config);
