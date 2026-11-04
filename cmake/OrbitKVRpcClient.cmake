@@ -30,10 +30,13 @@ foreach(_relative common_service.hpp context.hpp expected.hpp
                  _rpc_source "${_rpc_source}")
 endforeach()
 set(_rpc_overlay "${yalantinglibs_BINARY_DIR}/orbitkv-include")
-file(CONFIGURE OUTPUT "${_rpc_overlay}/ylt/coro_rpc/impl/coro_rpc_client.hpp"
-     CONTENT "${_rpc_source}" @ONLY)
-file(CONFIGURE OUTPUT "${_rpc_overlay}/ylt/coro_rpc/coro_rpc_client.hpp"
-     CONTENT "#pragma once\n#include <ylt/coro_rpc/impl/coro_rpc_client.hpp>\n"
-     @ONLY)
+file(
+  GENERATE
+  OUTPUT "${_rpc_overlay}/ylt/coro_rpc/impl/coro_rpc_client.hpp"
+  CONTENT "${_rpc_source}")
+file(
+  GENERATE
+  OUTPUT "${_rpc_overlay}/ylt/coro_rpc/coro_rpc_client.hpp"
+  CONTENT "#pragma once\n#include <ylt/coro_rpc/impl/coro_rpc_client.hpp>\n")
 target_include_directories(yalantinglibs BEFORE
                            INTERFACE "$<BUILD_INTERFACE:${_rpc_overlay}>")
