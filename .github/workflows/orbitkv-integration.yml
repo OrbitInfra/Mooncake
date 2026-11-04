@@ -4,7 +4,6 @@ on:
   push:
     branches: [orbitkv-integration-v0.3.14]
   workflow_dispatch: {}
-  workflow_call: {}
 
 permissions:
   contents: read

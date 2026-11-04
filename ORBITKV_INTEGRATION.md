@@ -90,15 +90,7 @@ runner. `tent_orbitkv_abi_test` checks all 23 consumed C symbols, signatures, an
 
 [The fork workflow](.github/workflows/orbitkv-integration.yml) runs both Linux
 configurations and uploads configuration, build logs, CTest logs, and per-case
-XML. If GitHub has not registered the new workflow from a branch push, dispatch
-it through the existing workflow ID without changing the default branch:
-
-```bash
-gh workflow run ci-on-label.yml --repo OrbitInfra/Mooncake \
-  --ref orbitkv-integration-v0.3.14
-```
-
-Inspect skipped GoogleTest cases as well as the CTest summary. Hardware
+XML. Inspect skipped GoogleTest cases as well as the CTest summary. Hardware
 RDMA, physical CUDA copies/context behavior, multi-GPU copies, and installed
 OrbitKV qualification remain separate hardware gates. A source-close receipt
 only proves whole-source CPU/TCP handler drain, not CUDA/RDMA physical drain or
