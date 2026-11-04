@@ -200,7 +200,7 @@ Status TcpTransport::getTransferStatus(SubBatchRef batch, int task_id,
     status.transferred_bytes =
         task.transferred_bytes.load(std::memory_order_acquire);
     if (status.s == TransferStatusEnum::FAILED && task.non_replayable_failure)
-        return Status::RpcServiceError("TCP WRITE outcome is unknown" LOC_MARK);
+        return task.failure_status;
     return Status::OK();
 }
 
@@ -263,6 +263,17 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
     if (shutting_down_.load(std::memory_order_acquire))
         return Status::InternalError("Transport shutting down");
 
+    auto deadline = std::chrono::steady_clock::now() + kRpcTimeout;
+    if (task->request.deadline_ns != 0 &&
+        task->request.deadline_ns <
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    deadline.time_since_epoch())
+                    .count())) {
+        deadline =
+            RpcDeadline(std::chrono::nanoseconds(task->request.deadline_ns));
+    }
+
     std::string rpc_server_addr, source_epoch;
     auto status =
         findRemoteSegment(task->request.target_offset, task->request.length,
@@ -276,77 +287,31 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         source_epoch = task->request.expected_source_epoch;
     }
 
-    Status last_error;
-    uint64_t delay_ms = params_.retry_base_delay_ms;
-
-    for (size_t attempt = 0; attempt <= params_.max_retry_count; ++attempt) {
-        if (shutting_down_.load(std::memory_order_acquire))
-            return Status::InternalError("Transport shutting down");
-
-        if (attempt > 0) {
-            VLOG(1) << "TCP transfer retry attempt " << attempt << "/"
-                    << params_.max_retry_count << ", backoff " << delay_ms
-                    << "ms";
-            LOG_EVERY_N(INFO, 100)
-                << "TCP transfer retry attempt " << attempt << "/"
-                << params_.max_retry_count << ", backoff " << delay_ms << "ms";
-            // Sleep in small increments so shutdown is not delayed
-            for (uint64_t i = 0; i < delay_ms; i += 100) {
-                if (shutting_down_.load(std::memory_order_acquire))
-                    return Status::InternalError("Transport shutting down");
-                std::this_thread::sleep_for(std::chrono::milliseconds(
-                    std::min(static_cast<uint64_t>(100), delay_ms - i)));
-            }
-            delay_ms = nextTcpRetryDelay(delay_ms, params_.retry_max_delay_ms);
-        }
-
-        if (task->request.opcode == Request::WRITE) {
-            status = ControlClient::sendData(
-                rpc_server_addr, task->request.target_offset,
-                task->request.source, task->request.length, source_epoch);
-        } else {
-            status = ControlClient::recvData(
-                rpc_server_addr, task->request.target_offset,
-                task->request.source, task->request.length, source_epoch);
-        }
-
-        if (status.ok()) return Status::OK();
-
-        last_error = status;
-        VLOG(1) << "TCP transfer attempt " << attempt
-                << " failed: " << status.ToString();
-        LOG_EVERY_N(WARNING, 1000) << "TCP transfer attempt " << attempt
-                                   << " failed: " << status.ToString();
-
-        if (task->request.opcode == Request::WRITE &&
-            status.IsRpcServiceError() && !status.IsRpcConnectionError()) {
-            task->non_replayable_failure = true;
-            return status;
-        }
-
-        if (!status.IsRpcServiceError() && !status.IsInternalError()) {
-            return status;
-        }
-
-        // Only a pre-send connection failure permits an endpoint refresh
-        // followed by automatic WRITE replay.
-        if (status.IsRpcConnectionError()) {
-            CHECK_STATUS(metadata_->segmentManager().invalidateRemote(
-                task->request.target_id));
-            if (attempt == params_.max_retry_count) break;
-            std::string refreshed_epoch;
-            auto resolve = findRemoteSegment(
-                task->request.target_offset, task->request.length,
-                task->request.target_id, rpc_server_addr, refreshed_epoch,
-                source_epoch);
-            if (!resolve.ok()) return resolve;
-            if (refreshed_epoch != source_epoch)
-                return Status::RpcServiceError(
-                    "Source epoch changed during retry");
-        }
+    // Reconnection belongs to the RPC owner: at most one pre-send retry,
+    // with the original epoch envelope and one absolute deadline. A second
+    // transport-level loop would multiply that budget and replay ambiguous
+    // READs (or reset a WRITE's deadline).
+    if (task->request.opcode == Request::WRITE) {
+        status = ControlClient::sendDataUntil(
+            rpc_server_addr, task->request.target_offset, task->request.source,
+            task->request.length, source_epoch, deadline);
+    } else {
+        status = ControlClient::recvDataUntil(
+            rpc_server_addr, task->request.target_offset, task->request.source,
+            task->request.length, source_epoch, deadline);
     }
-
-    return last_error;
+    if (status.IsRpcUnknownEffect() ||
+        (task->request.opcode == Request::WRITE && status.IsRpcServiceError() &&
+         !status.IsRpcConnectionError())) {
+        task->failure_status = status;
+        task->non_replayable_failure = true;
+    }
+    if (status.IsRpcConnectionError()) {
+        // Refresh metadata for a later explicit request, not a hidden replay.
+        (void)metadata_->segmentManager().invalidateRemote(
+            task->request.target_id);
+    }
+    return status;
 }
 
 Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
@@ -385,12 +350,8 @@ Status TcpTransport::sendNotification(SegmentID target_id,
                     "Empty RPC server addr" LOC_MARK);
             }
             auto status = ControlClient::notify(rpc_server_addr, message);
-            if (status.IsRpcServiceError()) {
-                // Perhaps rpc_server_addr can be updated in the future
-                return Status::NeedsRefreshCache(
-                    "RPC service error: " + std::string{status.message()} +
-                    LOC_MARK);
-            }
+            // The RPC owner already exhausted the only pre-send retry.
+            // NeedsRefreshCache here would replay a possibly delivered call.
             return status;
         });
 }

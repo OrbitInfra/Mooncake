@@ -194,10 +194,18 @@ TEST_F(SegmentDescRetryTest, HealthyMetadataHandlerRunsOnce) {
     });
 }
 
-TEST_F(SegmentDescRetryTest, ThrowingMetadataHandlerRunsExactlyTwice) {
+TEST_F(SegmentDescRetryTest,
+       TwoExplicitMetadataCallsEachRunThrowingHandlerOnce) {
     WithFreshCaller([&] {
         ASSERT_TRUE(StartServer("epoch1").ok());
         fail_metadata_.store(true);
+        const auto first = Read();
+        EXPECT_TRUE(first.status.IsRpcServiceError())
+            << first.status.ToString();
+        EXPECT_EQ(metadata_calls_.load(),
+                  1);  // No implicit replay of a delivered RPC.
+        // A distinct, explicit call preserves the original total-count
+        // assertion.
         const auto result = Read();
         EXPECT_TRUE(result.status.IsRpcServiceError())
             << result.status.ToString();

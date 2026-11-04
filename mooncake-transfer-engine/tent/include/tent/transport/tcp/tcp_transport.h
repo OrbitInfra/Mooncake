@@ -39,8 +39,8 @@ struct TcpParams {
     size_t max_concurrent_tasks = 16;     // worker thread pool size
 };
 
-// Next sleep used by doTransferWithRetry after a failed attempt. Kept as a
-// pure function so the cap is unit-testable without standing up a peer.
+// Legacy backoff configuration math. Data-RPC recovery is now bounded by the
+// RPC owner; it never starts another transport-level retry loop.
 inline uint64_t nextTcpRetryDelay(uint64_t delay_ms, uint64_t cap) {
     return std::min(delay_ms * 2, cap);
 }
@@ -54,6 +54,7 @@ struct TcpTask {
     std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::PENDING};
     std::atomic<size_t> transferred_bytes{0};
     bool non_replayable_failure{false};  // Published by status_word.
+    Status failure_status;  // Published by status_word with the terminal flag.
     uint64_t target_addr = 0;
 
     TcpTask() = default;
@@ -65,6 +66,7 @@ struct TcpTask {
           transferred_bytes(
               other.transferred_bytes.load(std::memory_order_relaxed)),
           non_replayable_failure(other.non_replayable_failure),
+          failure_status(std::move(other.failure_status)),
           target_addr(other.target_addr) {}
     TcpTask(const TcpTask &) = delete;
     TcpTask &operator=(const TcpTask &) = delete;

@@ -3688,7 +3688,8 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
         transport->getTransferStatus(sub_batch, task.sub_task_id, task_status);
     if (task.type == TCP && task_status.s == FAILED &&
         result.IsRpcServiceError()) {
-        // Standard TCP reports an uncertain WRITE through this error result.
+        // Standard TCP reports a non-replayable data RPC through this error
+        // result.
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
         task.suppress_failover = true;
         return Status::OK();
@@ -3848,12 +3849,8 @@ Status TransferEngineImpl::sendNotificationViaRpc(SegmentID target_id,
                     "Empty RPC server addr" LOC_MARK);
             }
             auto status = ControlClient::notify(rpc_server_addr, notifi);
-            if (status.IsRpcServiceError()) {
-                // Perhaps rpc_server_addr can be updated in the future
-                return Status::NeedsRefreshCache(
-                    "RPC service error: " + std::string{status.message()} +
-                    LOC_MARK);
-            }
+            // The RPC owner already exhausted the only pre-send retry.
+            // NeedsRefreshCache here would replay a possibly delivered call.
             return status;
         });
 }
@@ -3867,12 +3864,8 @@ Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
                     "Empty RPC server addr" LOC_MARK);
             }
             auto status = ControlClient::probe(rpc_server_addr);
-            if (status.IsRpcServiceError()) {
-                // Perhaps rpc_server_addr can be updated in the future
-                return Status::NeedsRefreshCache(
-                    "RPC service error: " + std::string{status.message()} +
-                    LOC_MARK);
-            }
+            // The RPC owner already exhausted the only pre-send retry.
+            // NeedsRefreshCache here would replay a possibly delivered call.
             return status;
         });
 }

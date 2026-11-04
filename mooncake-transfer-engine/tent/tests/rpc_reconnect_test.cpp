@@ -24,11 +24,25 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <future>
+
+#include "rpc_fault_peer.h"
 
 #include "tent/rpc/rpc.h"
 
 namespace mooncake {
 namespace tent {
+class CoroRpcAgentTestPeer {
+   public:
+    static void beforeSend(CoroRpcAgent& agent, std::function<void()> hook) {
+        agent.before_send_for_test_ = std::move(hook);
+    }
+    static void limits(CoroRpcAgent& agent, size_t peers, size_t connections) {
+        agent.max_cached_peers_ = peers;
+        agent.max_connections_per_peer_ = connections;
+    }
+    static auto usage(CoroRpcAgent& agent) { return agent.poolUsageForTest(); }
+};
 namespace {
 
 using namespace std::chrono_literals;
@@ -146,23 +160,23 @@ class RpcReconnectTest : public ::testing::Test {
     std::string addr_;
 };
 
-// The point of the change. After a restart every pooled connection is stale.
-// The first call to use one fails - a socket only reports the peer's death
-// when it is written to - but that single failure must take the rest of the
-// pool with it, so the next call connects fresh and succeeds. Without the
-// flush the caller pays one failed call per stale connection, and the retry
-// budget above (TcpTransport: max_retry_count) runs out before the pool does.
+// The peer dies AFTER the successful idle check. This is the ambiguous
+// boundary: preserve the original failure assertion, flush the pool, and let
+// only a later explicit request reconnect. The pre-send restart is tested
+// below.
 TEST_F(RpcReconnectTest, StalePoolIsFlushedSoTheNextCallSucceeds) {
     StartServer(0);
     CoroRpcAgent client;
     ASSERT_NO_FATAL_FAILURE(FillPool(client));
 
-    RestartServerSamePort();
+    CoroRpcAgentTestPeer::beforeSend(client, [&] { RestartServerSamePort(); });
 
     std::string response;
     auto first = client.call(addr_, kEchoFunc, "after-restart", response);
     EXPECT_FALSE(first.ok()) << "expected the stale connection to fail";
 
+    EXPECT_TRUE(first.IsRpcUnknownEffect()) << first.ToString();
+    CoroRpcAgentTestPeer::beforeSend(client, {});
     response.clear();
     auto second = client.call(addr_, kEchoFunc, "after-restart", response);
     EXPECT_TRUE(second.ok()) << second.ToString();
@@ -262,6 +276,142 @@ TEST_F(RpcReconnectTest, ConcurrentStaleCallsAllRecover) {
     (void)round("first");
     // By the second round every caller is on a fresh connection.
     EXPECT_EQ(round("second"), kCallers);
+}
+
+TEST_F(RpcReconnectTest, ClosedIdleConnectionReconnectsBeforeFirstSend) {
+    StartServer(0);
+    CoroRpcAgent client;
+    ASSERT_NO_FATAL_FAILURE(FillPool(client));
+    RestartServerSamePort();
+    std::string response;
+    auto status = client.call(addr_, kEchoFunc, "first-request", response);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(response, "first-request");
+    EXPECT_EQ(CoroRpcAgentTestPeer::usage(client).second, 1u);
+}
+
+TEST_F(RpcReconnectTest, AddressCacheRemainsBoundedAcrossRestarts) {
+    CoroRpcAgent client;
+    CoroRpcAgentTestPeer::limits(client, 3, 2);
+    for (int peer = 0; peer < 20; ++peer) {
+        StartServer(0);
+        std::string response;
+        ASSERT_TRUE(client.call(addr_, kEchoFunc, "bounded", response).ok());
+        EXPECT_EQ(response, "bounded");
+        auto [peers, connections] = CoroRpcAgentTestPeer::usage(client);
+        EXPECT_LE(peers, 3u);
+        EXPECT_LE(connections, 6u);
+        StopServer();
+    }
+}
+
+TEST_F(RpcReconnectTest, ActiveConnectionsCannotExceedPoolBudget) {
+    StartServer(0);
+    CoroRpcAgent client;
+    CoroRpcAgentTestPeer::limits(client, 1, 2);
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    std::atomic<int> entered{0};
+    ASSERT_TRUE(server_
+                    ->registerFunction(
+                        5005,
+                        [&](const auto&, auto&) {
+                            ++entered;
+                            released.wait_for(3s);
+                        },
+                        true)
+                    .ok());
+    auto invoke = [&] {
+        std::string response;
+        return client.call(addr_, 5005, "hold", response);
+    };
+    auto one = std::async(std::launch::async, invoke);
+    auto two = std::async(std::launch::async, invoke);
+    auto deadline = steady_clock::now() + 2s;
+    while (entered.load() != 2 && steady_clock::now() < deadline)
+        std::this_thread::sleep_for(1ms);
+    EXPECT_EQ(entered.load(), 2);
+    std::string response;
+    EXPECT_TRUE(
+        client.call(addr_, kEchoFunc, "excess", response).IsTooManyRequests());
+    EXPECT_TRUE(client.call("127.0.0.1:1", kEchoFunc, "excess-peer", response)
+                    .IsTooManyRequests());
+    EXPECT_EQ(CoroRpcAgentTestPeer::usage(client),
+              std::make_pair(size_t{1}, size_t{2}));
+    release.set_value();
+    EXPECT_TRUE(one.get().ok());
+    EXPECT_TRUE(two.get().ok());
+    EXPECT_LE(CoroRpcAgentTestPeer::usage(client).second, 2u);
+}
+
+TEST_F(RpcReconnectTest, RetryDoesNotResetExpiredCallerDeadline) {
+    StartServer(0);
+    CoroRpcAgent client;
+    ASSERT_NO_FATAL_FAILURE(FillPool(client));
+    RestartServerSamePort();
+    CoroRpcAgentTestPeer::beforeSend(client,
+                                     [] { std::this_thread::sleep_for(50ms); });
+    std::string response;
+    const auto start = steady_clock::now();
+    auto status = client.call(addr_, kSideEffectThenThrowFunc, "expired",
+                              response, start + 30ms);
+    EXPECT_TRUE(status.IsRpcConnectionError()) << status.ToString();
+    EXPECT_NE(status.message().find("deadline expired"),
+              std::string_view::npos);
+    EXPECT_EQ(g_side_effects.load(), 0);
+    EXPECT_LT(steady_clock::now() - start, 1s);
+}
+
+TEST_F(RpcReconnectTest, InFlightTimeoutIsUnknownAndNeverReplayed) {
+    StartServer(0);
+    std::atomic<int> entered{0};
+    ASSERT_TRUE(server_
+                    ->registerFunction(
+                        5006,
+                        [&](const auto&, auto&) {
+                            ++entered;
+                            std::this_thread::sleep_for(100ms);
+                        },
+                        true)
+                    .ok());
+    CoroRpcAgent client;
+    std::string response;
+    ASSERT_TRUE(client.call(addr_, kEchoFunc, "warm", response).ok());
+    auto status =
+        client.call(addr_, 5006, "once", response, steady_clock::now() + 30ms);
+    EXPECT_TRUE(status.IsRpcUnknownEffect()) << status.ToString();
+    StopServer();  // Drain the real handler before its captured owners
+                   // disappear.
+    EXPECT_EQ(entered.load(), 1);
+    EXPECT_EQ(CoroRpcAgentTestPeer::usage(client).second, 0u);
+}
+
+TEST(RpcConnectionFault, DeliveredRequestIsNeverReplayedAfterLostOrShortReply) {
+    for (auto fault :
+         {RpcFaultPeer::Fault::Eof, RpcFaultPeer::Fault::Reset,
+          RpcFaultPeer::Fault::ShortHeader, RpcFaultPeer::Fault::ShortBody}) {
+        SCOPED_TRACE(static_cast<int>(fault));
+        RpcFaultPeer peer(fault);
+        ASSERT_TRUE(peer.available());
+        CoroRpcAgent client;
+        std::string response;
+        ASSERT_TRUE(
+            client.call(peer.address(), SendData, "warm", response).ok());
+        auto status = client.call(peer.address(), SendData, "side-effect",
+                                  response, steady_clock::now() + 1s);
+        EXPECT_TRUE(status.IsRpcUnknownEffect()) << status.ToString();
+        EXPECT_FALSE(status.IsRpcConnectionError());
+        EXPECT_EQ(peer.requests.load(),
+                  2);  // Warmup plus one possibly delivered request.
+        EXPECT_EQ(peer.connections.load(), 1);
+        EXPECT_EQ(CoroRpcAgentTestPeer::usage(client).second, 0u);
+        ASSERT_TRUE(client
+                        .call(peer.address(), SendData, "explicit-new-request",
+                              response)
+                        .ok());
+        EXPECT_EQ(peer.requests.load(), 3);
+        EXPECT_EQ(peer.connections.load(), 2);
+    }
 }
 
 }  // namespace

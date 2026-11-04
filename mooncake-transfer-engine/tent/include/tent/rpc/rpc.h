@@ -54,6 +54,9 @@ enum RpcFuncID {
 };
 
 class ClientPool;
+class CoroRpcAgentTestPeer;
+using RpcDeadline = std::chrono::steady_clock::time_point;
+inline constexpr auto kRpcTimeout = std::chrono::seconds(30);
 
 class CoroRpcAgent {
    public:
@@ -92,27 +95,36 @@ class CoroRpcAgent {
     uint64_t closeDispatch(std::chrono::milliseconds timeout);
 
     Status call(const std::string &server_addr, int func_id,
-                const std::string_view &request, std::string &response);
+                const std::string_view &request, std::string &response,
+                RpcDeadline deadline = std::chrono::steady_clock::now() +
+                                       kRpcTimeout);
 
     // Same as call(), but moves the request into the coroutine instead of
     // copying it, for large payloads.
     Status callOwned(const std::string &server_addr, int func_id,
-                     std::string request, std::string &response);
+                     std::string request, std::string &response,
+                     RpcDeadline deadline = std::chrono::steady_clock::now() +
+                                            kRpcTimeout);
 
     using AsyncCallback = std::function<void(Status, std::string)>;
     void callAsync(const std::string &server_addr, int func_id,
-                   const std::string &request, AsyncCallback callback);
-    // Same as callAsync(), but retries once on a transport-level RPC failure.
-    // Only for idempotent RPCs: a failure may arrive after the peer already ran
-    // the handler, so a retry can run it twice.
+                   const std::string &request, AsyncCallback callback,
+                   RpcDeadline deadline = std::chrono::steady_clock::now() +
+                                          kRpcTimeout);
+    // Compatibility spelling: all calls now retry only before dispatch, once.
     void callAsyncRetryOnce(const std::string &server_addr, int func_id,
                             const std::string &request, AsyncCallback callback);
 
     async_simple::coro::Lazy<std::pair<Status, std::string>> callCoroutine(
         std::string server_addr, int func_id, std::string request,
-        bool retry_rpc_error_once = false);
+        RpcDeadline deadline = std::chrono::steady_clock::now() + kRpcTimeout);
 
    private:
+    friend class CoroRpcAgentTestPeer;
+    std::pair<size_t, size_t> poolUsageForTest();
+    std::function<void()> before_send_for_test_;
+    size_t max_cached_peers_{64};
+    size_t max_connections_per_peer_{16};
     async_simple::coro::Lazy<void> process(int func_id);
 
     std::shared_ptr<ClientPool> getOrCreatePool(const std::string &server_addr);

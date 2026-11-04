@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 
+#include "rpc_fault_peer.h"
 #include "tent/common/config.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transfer_engine_impl.h"
@@ -74,6 +75,9 @@ class TcpTransportTestPeer {
         tcp.thread_pool_->enqueue([size] { fail_allocation_size = size; })
             .get();
     }
+    static void retries(TcpTransport& tcp, size_t count) {
+        tcp.params_.max_retry_count = count;
+    }
     static void drain(TcpTransport& tcp) {
         tcp.thread_pool_->enqueue([] {}).get();
     }
@@ -85,10 +89,19 @@ using namespace std::chrono_literals;
 class ControlledTcp : public TcpTransport {
    public:
     bool pause = false;
+    bool notify_unavailable = false;
     TcpSubBatch* last_batch = nullptr;
     std::promise<void> entered, resume;
     std::shared_future<void> resumed = resume.get_future().share();
     std::weak_ptr<int> callback_lifetime;
+
+    Status sendNotification(SegmentID target,
+                            const Notification& notification) override {
+        if (notify_unavailable)
+            return Status::DeviceNotFound(
+                "test notification channel unavailable");
+        return TcpTransport::sendNotification(target, notification);
+    }
 
     Status submitTransferTasks(SubBatchRef batch,
                                const std::vector<Request>& requests) override {
@@ -119,12 +132,14 @@ class TcpRegression : public testing::Test {
     std::shared_ptr<ControlledTcp> tcp;
     std::shared_ptr<ControlService> metadata;
 
-    void SetUp() override {
+    void SetUp() override { startEngine("0"); }
+
+    void startEngine(const std::string& port) {
         auto config = std::make_shared<Config>();
         config->set("metadata_type", "p2p");
         config->set("metadata_servers", "");
         config->set("rpc_server_hostname", "127.0.0.1");
-        config->set("rpc_server_port", "0");
+        config->set("rpc_server_port", port);
         config->set("rpc_server_threads", 2);
         config->set("enable_progress_worker", true);
         config->set("enable_auto_failover_on_poll", false);
@@ -384,6 +399,145 @@ TEST_F(TcpRegression, ExpectedEpochIsCheckedBeforeTcpRead) {
     ASSERT_TRUE(engine->getTransferStatus(batch, status).ok());
     EXPECT_EQ(status.s, FAILED);
     EXPECT_EQ(status.transferred_bytes, 0u);
+    EXPECT_TRUE(engine->freeBatch(batch).ok());
+}
+
+TEST_F(TcpRegression, SamePortReconnectPreservesSourceEpochFence) {
+    const auto address = engine->getSegmentName();
+    const auto epoch = sourceEpoch();
+    std::array<char, 16> local;
+    local.fill('L');
+    ASSERT_TRUE(ControlClient::sendData(address,
+                                        reinterpret_cast<uint64_t>(data.data()),
+                                        local.data(), local.size(), epoch)
+                    .ok());
+    ASSERT_TRUE(tcp->uninstall().ok());
+    ASSERT_TRUE(engine->unregisterLocalMemory(data.data(), data.size()).ok());
+    engine.reset();
+    tcp.reset();
+    metadata.reset();
+    data.fill('N');
+    startEngine(address.substr(address.rfind(':') + 1));
+    ASSERT_EQ(engine->getSegmentName(), address);
+    ASSERT_NE(sourceEpoch(), epoch);
+    for (auto call : {ControlClient::sendData, ControlClient::recvData}) {
+        auto status = call(address, reinterpret_cast<uint64_t>(data.data()),
+                           local.data(), local.size(), epoch);
+        EXPECT_TRUE(status.IsRpcServiceError()) << status.ToString();
+        EXPECT_FALSE(status.IsRpcUnknownEffect()) << status.ToString();
+        EXPECT_NE(status.message().find("epoch mismatch"),
+                  std::string_view::npos);
+        EXPECT_EQ(data[0], 'N');
+        EXPECT_EQ(local[0], 'L');
+    }
+    ASSERT_TRUE(ControlClient::sendData(
+                    address, reinterpret_cast<uint64_t>(data.data()),
+                    local.data(), local.size(), sourceEpoch())
+                    .ok());
+    EXPECT_EQ(data[0], 'L');
+}
+
+TEST_F(TcpRegression, LostReplyCannotTriggerReadOrWriteReplay) {
+    TcpTransportTestPeer::retries(*tcp, 3);
+    for (auto opcode : {Request::READ, Request::WRITE}) {
+        SCOPED_TRACE(opcode);
+        RpcFaultPeer peer(RpcFaultPeer::Fault::Eof);
+        ASSERT_TRUE(peer.available());
+        ASSERT_TRUE(metadata->segmentManager()
+                        .updateLocal([&](SegmentDesc& desc) {
+                            desc.rpc_server_addr = peer.address();
+                            return Status::OK();
+                        })
+                        .ok());
+        // A successful WRITE warms this production worker's thread-local pool.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            auto request = writeRequest();
+            if (attempt == 1) request.opcode = opcode;
+            auto batch = engine->allocateBatch(1);
+            ASSERT_TRUE(engine->submitTransfer(batch, {request}).ok());
+            TcpTransportTestPeer::drain(*tcp);
+            TransferStatus status{};
+            ASSERT_TRUE(engine->getTransferStatus(batch, status).ok());
+            EXPECT_EQ(status.s, attempt == 0 ? COMPLETED : FAILED);
+            if (attempt == 1) {
+                auto error = tcp->getTransferStatus(tcp->last_batch, 0, status);
+                EXPECT_TRUE(error.IsRpcUnknownEffect()) << error.ToString();
+                EXPECT_EQ(status.transferred_bytes, 0u);
+            }
+            EXPECT_TRUE(engine->freeBatch(batch).ok());
+        }
+        EXPECT_EQ(peer.requests.load(), 2);
+        EXPECT_EQ(peer.connections.load(), 1);
+    }
+}
+
+TEST_F(TcpRegression, ControlWrappersNeverReplayUnknownEffect) {
+    std::atomic<int> notifications{0}, probes{0};
+    auto desc = *metadata->segmentManager().getLocal();
+    CoroRpcAgent peer;
+    ASSERT_TRUE(peer.registerFunction(GetSegmentDesc,
+                                      [&](const auto&, auto& response) {
+                                          response = json(desc).dump();
+                                      })
+                    .ok());
+    ASSERT_TRUE(
+        peer.registerFunction(SubscribeSegmentUpdate, [](const auto&, auto&) {})
+            .ok());
+    ASSERT_TRUE(peer.registerFunction(Notify,
+                                      [&](const auto&, auto&) {
+                                          ++notifications;
+                                          throw std::runtime_error(
+                                              "after notification side effect");
+                                      })
+                    .ok());
+    ASSERT_TRUE(peer.registerFunction(Probe,
+                                      [&](const auto&, auto&) {
+                                          ++probes;
+                                          throw std::runtime_error(
+                                              "after probe delivery");
+                                      })
+                    .ok());
+    uint16_t port = 0;
+    ASSERT_TRUE(peer.start(port).ok());
+    desc.name = desc.rpc_server_addr = "127.0.0.1:" + std::to_string(port);
+    SegmentID tcp_remote = 0, engine_remote = 0;
+    ASSERT_TRUE(
+        metadata->segmentManager().openRemote(tcp_remote, desc.name).ok());
+    ASSERT_TRUE(engine->openSegment(engine_remote, desc.name).ok());
+    ASSERT_NE(tcp_remote, LOCAL_SEGMENT_ID);
+    ASSERT_NE(engine_remote, LOCAL_SEGMENT_ID);
+    Notification notification{"no-replay", "one delivery per explicit call"};
+    auto status = tcp->sendNotification(tcp_remote, notification);
+    EXPECT_TRUE(status.IsRpcUnknownEffect()) << status.ToString();
+    EXPECT_EQ(notifications.load(), 1);
+    tcp->notify_unavailable = true;  // Exercise the engine's own RPC fallback.
+    status = engine->sendNotification(engine_remote, notification);
+    EXPECT_TRUE(status.IsRpcUnknownEffect()) << status.ToString();
+    EXPECT_EQ(notifications.load(), 2);
+    status = engine->probePeerAliveByID(engine_remote);
+    EXPECT_TRUE(status.IsRpcUnknownEffect()) << status.ToString();
+    EXPECT_EQ(probes.load(), 1);
+}
+
+TEST_F(TcpRegression, ExpiredDataRpcDeadlineDoesNotSend) {
+    RpcFaultPeer peer(RpcFaultPeer::Fault::Eof);
+    ASSERT_TRUE(peer.available());
+    ASSERT_TRUE(metadata->segmentManager()
+                    .updateLocal([&](SegmentDesc& desc) {
+                        desc.rpc_server_addr = peer.address();
+                        return Status::OK();
+                    })
+                    .ok());
+    auto request = writeRequest();
+    request.deadline_ns = 1;
+    auto batch = engine->allocateBatch(1);
+    ASSERT_TRUE(engine->submitTransfer(batch, {request}).ok());
+    TcpTransportTestPeer::drain(*tcp);
+    TransferStatus status{};
+    ASSERT_TRUE(engine->getTransferStatus(batch, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_EQ(peer.requests.load(), 0);
+    EXPECT_EQ(peer.connections.load(), 0);
     EXPECT_TRUE(engine->freeBatch(batch).ok());
 }
 

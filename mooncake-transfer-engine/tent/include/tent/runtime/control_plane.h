@@ -173,6 +173,15 @@ class ControlClient {
                            uint64_t peer_mem_addr, void* local_mem_addr,
                            size_t length, const std::string& source_epoch);
 
+    static Status sendDataUntil(const std::string& server_addr,
+                                uint64_t peer_mem_addr, void* local_mem_addr,
+                                size_t length, const std::string& source_epoch,
+                                RpcDeadline deadline);
+    static Status recvDataUntil(const std::string& server_addr,
+                                uint64_t peer_mem_addr, void* local_mem_addr,
+                                size_t length, const std::string& source_epoch,
+                                RpcDeadline deadline);
+
     static Status notify(const std::string& server_addr,
                          const Notification& message);
 

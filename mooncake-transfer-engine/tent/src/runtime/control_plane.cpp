@@ -65,15 +65,8 @@ thread_local CoroRpcAgent tl_rpc_agent;
 Status ControlClient::getSegmentDesc(const std::string& server_addr,
                                      std::string& response) {
     std::string request;
-    auto status =
-        tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
-    if (status.IsRpcServiceError()) {
-        // A failed stale connection is discarded by the RPC agent. Retry this
-        // read-only operation once; other control RPCs may have side effects.
-        return tl_rpc_agent.call(server_addr, GetSegmentDesc, request,
-                                 response);
-    }
-    return status;
+    // The RPC owner alone controls the pre-send retry budget and deadline.
+    return tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
 }
 
 Status ControlClient::decodeBootstrapResponse(const std::string& response_raw,
@@ -126,6 +119,16 @@ Status ControlClient::bootstrapUb(const std::string& server_addr,
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length, const std::string& source_epoch) {
+    return sendDataUntil(server_addr, peer_mem_addr, local_mem_addr, length,
+                         source_epoch,
+                         std::chrono::steady_clock::now() + kRpcTimeout);
+}
+
+Status ControlClient::sendDataUntil(const std::string& server_addr,
+                                    uint64_t peer_mem_addr,
+                                    void* local_mem_addr, size_t length,
+                                    const std::string& source_epoch,
+                                    RpcDeadline deadline) {
     // Check before addition/allocation or reading the caller's source buffer.
     if (length > kTcpMaxWriteBytes)
         return Status::InvalidArgument("TCP WRITE exceeds RPC payload limit");
@@ -150,8 +153,8 @@ Status ControlClient::sendData(const std::string& server_addr,
         CHECK_STATUS(
             loader.copy(request.data() + sizeof(desc), local_mem_addr, length));
     }
-    auto status = tl_rpc_agent.callOwned(server_addr, SendData,
-                                         std::move(request), response);
+    auto status = tl_rpc_agent.callOwned(
+        server_addr, SendData, std::move(request), response, deadline);
     if (!status.ok()) return status;
     if (!response.empty()) return Status::RpcServiceError(response);
     return Status::OK();
@@ -160,6 +163,16 @@ Status ControlClient::sendData(const std::string& server_addr,
 Status ControlClient::recvData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length, const std::string& source_epoch) {
+    return recvDataUntil(server_addr, peer_mem_addr, local_mem_addr, length,
+                         source_epoch,
+                         std::chrono::steady_clock::now() + kRpcTimeout);
+}
+
+Status ControlClient::recvDataUntil(const std::string& server_addr,
+                                    uint64_t peer_mem_addr,
+                                    void* local_mem_addr, size_t length,
+                                    const std::string& source_epoch,
+                                    RpcDeadline deadline) {
     if (length > kTcpMaxReadBytes)
         return Status::InvalidArgument("TCP READ exceeds RPC payload limit");
     std::string request, response;
@@ -169,7 +182,8 @@ Status ControlClient::recvData(const std::string& server_addr,
     memcpy(desc.source_epoch, source_epoch.data(), 32);
     request.resize(sizeof(XferDataDesc));
     memcpy(&request[0], &desc, sizeof(desc));
-    auto status = tl_rpc_agent.call(server_addr, RecvData, request, response);
+    auto status =
+        tl_rpc_agent.call(server_addr, RecvData, request, response, deadline);
     if (!status.ok()) return status;
     if (response.empty() || length == SIZE_MAX ||
         response.size() != length + 1 || response[0] != 0)

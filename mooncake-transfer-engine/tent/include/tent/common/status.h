@@ -109,6 +109,8 @@ class Status final {
         kRpcServiceError = 132,
         kMalformedJson = 133,
         kRpcConnectionError = 134,  // Failed before dispatching the request.
+        kRpcUnknownEffect =
+            135,  // Request may have reached the peer; no replay.
         kInternalError = 199,
 
         kNotImplemented = 200,
@@ -163,8 +165,10 @@ class Status final {
     TYPE_CHECK(CudaError);
     TYPE_CHECK(MetadataError);
     TYPE_CHECK(RpcConnectionError);
+    TYPE_CHECK(RpcUnknownEffect);
     [[nodiscard]] bool IsRpcServiceError() const {
-        return code_ == Code::kRpcServiceError || IsRpcConnectionError();
+        return code_ == Code::kRpcServiceError || IsRpcConnectionError() ||
+               IsRpcUnknownEffect();
     }
     static Status RpcServiceError(std::string_view msg) {
         return Status(Code::kRpcServiceError, msg);
