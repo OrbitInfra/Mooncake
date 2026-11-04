@@ -76,7 +76,11 @@ int warmupMrRegistrationParallel(RdmaContext* context, void* addr,
 
 LocalBufferManager::LocalBufferManager() {}
 
-LocalBufferManager::~LocalBufferManager() { clear(); }
+LocalBufferManager::~LocalBufferManager() {
+    const auto status = clear();
+    if (!status.ok())
+        LOG(FATAL) << "RDMA buffer teardown retains failed MRs: " << status;
+}
 
 static inline int getAccessFlags(Permission perm,
                                  bool relaxed_ordering = false) {
@@ -124,17 +128,17 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
     Status failure;
     const auto register_context = [&](size_t id) {
         auto* context = contexts[id];
-        const int access = getAccessFlags(
-            options.perm, context->isRelaxedOrderingEnabled());
-        registrations[id] = context->registerMemReg(
-            (void*)desc.addr, desc.length, access);
+        const int access =
+            getAccessFlags(options.perm, context->isRelaxedOrderingEnabled());
+        registrations[id] =
+            context->registerMemReg((void*)desc.addr, desc.length, access);
     };
     try {
         for (size_t id = 0; id < contexts.size(); ++id) {
             if (!contexts[id]) continue;
             if (!force_sequential && context_count > 1) {
-                tasks.emplace_back(std::async(std::launch::async,
-                                              register_context, id));
+                tasks.emplace_back(
+                    std::async(std::launch::async, register_context, id));
             } else {
                 register_context(id);
             }
@@ -149,6 +153,7 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
             if (failure.ok()) failure = Status::RdmaError(error.what());
         }
     }
+    std::string failed_devices;
     {
         RWSpinlock::WriteGuard guard(lock_);
         auto& retained = buffer_list_.at(range).mem_reg_map;
@@ -157,10 +162,8 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
             if (!context) continue;
             if (!registrations[id]) {
                 retained.erase(context);
-                if (failure.ok())
-                    failure = Status::RdmaError(
-                        "Unable to register buffer of local memory segment"
-                        LOC_MARK);
+                if (!failed_devices.empty()) failed_devices += ", ";
+                failed_devices += context->name();
                 continue;
             }
             retained.at(context) = registrations[id];
@@ -171,7 +174,17 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
         if (!context_count && failure.ok())
             failure = Status::RdmaError("No RDMA context for buffer" LOC_MARK);
     }
-    if (!failure.ok()) return failure;
+    if (!failed_devices.empty())
+        failure = Status::RdmaError(
+            "Unable to register buffer of local memory segment on " +
+            failed_devices + LOC_MARK);
+    if (!failure.ok()) {
+        // Preserve upstream eager rollback when it succeeds. removeBuffer
+        // retains every failed MR in both owners when cleanup cannot finish.
+        auto cleanup = removeBuffer(desc);
+        if (!cleanup.ok()) LOG(WARNING) << cleanup.ToString();
+        return failure;
+    }
     desc.transports.push_back(TransportType::RDMA);
     return Status::OK();
 }
@@ -186,8 +199,8 @@ Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
     Status failure;
     try {
         for (auto& desc : desc_list) {
-            tasks.emplace_back(std::async(
-                std::launch::async, [this, &desc, options]() {
+            tasks.emplace_back(
+                std::async(std::launch::async, [this, &desc, options]() {
                     return addBufferInternal(desc, options, true);
                 }));
         }
@@ -200,6 +213,18 @@ Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
             if (!status.ok() && failure.ok()) failure = status;
         } catch (const std::exception& error) {
             if (failure.ok()) failure = Status::RdmaError(error.what());
+        }
+    }
+    if (!failure.ok()) {
+        for (auto& desc : desc_list) {
+            auto cleanup = removeBuffer(desc);
+            if (!cleanup.ok()) LOG(WARNING) << cleanup.ToString();
+            // A failed batch exports no usable RDMA range, even if a cleanup
+            // owner must retain its keys for another deregistration attempt.
+            desc.transports.erase(
+                std::remove(desc.transports.begin(), desc.transports.end(),
+                            TransportType::RDMA),
+                desc.transports.end());
         }
     }
     return failure;
@@ -273,8 +298,10 @@ Status LocalBufferManager::removeDevice(RdmaContext* context, bool do_unreg) {
     if (iter == context_list_.end()) return Status::OK();
     for (auto& buffer : buffer_list_) {
         if (!buffer.second.mem_reg_map.count(context)) continue;
-        if (do_unreg)
-            context->unregisterMemReg(buffer.second.mem_reg_map[context]);
+        if (do_unreg &&
+            context->unregisterMemReg(buffer.second.mem_reg_map[context]))
+            return Status::RdmaError(
+                "Device still owns a registered buffer" LOC_MARK);
         buffer.second.mem_reg_map.erase(context);
     }
     *iter = nullptr;
@@ -283,11 +310,25 @@ Status LocalBufferManager::removeDevice(RdmaContext* context, bool do_unreg) {
 
 Status LocalBufferManager::clear() {
     RWSpinlock::WriteGuard guard(lock_);
-    for (auto& buffer : buffer_list_) {
-        for (auto& elem : buffer.second.mem_reg_map)
-            elem.first->unregisterMemReg(elem.second);
+    bool failed = false;
+    for (auto buffer = buffer_list_.begin(); buffer != buffer_list_.end();) {
+        auto& registrations = buffer->second.mem_reg_map;
+        for (auto it = registrations.begin(); it != registrations.end();) {
+            if (it->first->unregisterMemReg(it->second)) {
+                failed = true;
+                ++it;
+            } else {
+                it = registrations.erase(it);
+            }
+        }
+        if (registrations.empty())
+            buffer = buffer_list_.erase(buffer);
+        else
+            ++buffer;
     }
-    buffer_list_.clear();
+    if (failed)
+        return Status::RdmaError(
+            "RDMA buffers remain owned after cleanup" LOC_MARK);
     context_list_.clear();
     return Status::OK();
 }

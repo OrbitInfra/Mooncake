@@ -1,0 +1,58 @@
+name: OrbitKV TENT integration
+
+on:
+  push:
+    branches: [orbitkv-integration-v0.3.14]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ['OFF', 'ON']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libibverbs-dev libgoogle-glog-dev \
+            libjsoncpp-dev libnuma-dev libyaml-cpp-dev libgflags-dev libssl-dev \
+            liburing-dev libfmt-dev libcli11-dev libunwind-dev python3-dev
+      - name: Install CUDA 13 toolkit for compile and injected tests
+        if: matrix.cuda == 'ON'
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '13.0.2'
+          method: network
+          sub-packages: '["nvcc", "cudart-dev", "nvrtc-dev", "driver-dev"]'
+      - name: Build and test the OrbitKV configuration
+        env:
+          USE_CUDA: ${{ matrix.cuda }}
+          BUILD_JOBS: '2'
+        run: |
+          if [[ "$USE_CUDA" == ON ]]; then
+            sudo ln -sf libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+            export LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}"
+          fi
+          set -o pipefail
+          scripts/ci/run_orbitkv_tent_checks.sh build-orbitkv 2>&1 | tee orbitkv-native.log
+      - name: Preserve build and per-case test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orbitkv-tent-cuda-${{ matrix.cuda }}
+          path: |
+            orbitkv-native.log
+            build-orbitkv/CMakeCache.txt
+            build-orbitkv/Testing/Temporary/
+            build-orbitkv/test-results/
+          if-no-files-found: warn

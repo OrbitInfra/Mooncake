@@ -302,7 +302,11 @@ RdmaTransport::RdmaTransport()
       notify_worker_running_(false),
       notify_poll_interval_us_(10) {}  // Start at 10us
 
-RdmaTransport::~RdmaTransport() { uninstall(); }
+RdmaTransport::~RdmaTransport() {
+    const auto status = uninstall();
+    if (!status.ok())
+        LOG(FATAL) << "RDMA teardown cannot release owners: " << status;
+}
 
 size_t RdmaTransport::initializeContexts() {
     context_set_.clear();
@@ -446,7 +450,7 @@ Status RdmaTransport::uninstall() {
 
     // Drain CQ and dest-GPU visibility while MRs and QPs are still alive.
     // Idempotent when deconstruct() already called quiesce().
-    (void)quiesce();
+    CHECK_STATUS(quiesce());
 
     if (installed_) {
         // Stop notification worker thread
@@ -465,7 +469,7 @@ Status RdmaTransport::uninstall() {
             orphans_pending_.store(false, std::memory_order_release);
         }
         metadata_.reset();
-        local_buffer_manager_.clear();
+        CHECK_STATUS(local_buffer_manager_.clear());
         context_set_.clear();
         context_name_lookup_.clear();
         installed_ = false;

@@ -37,6 +37,17 @@ namespace mooncake {
 // left the normal lifecycle still holds.
 class TransferEngineImplTestPeer {
    public:
+    static tent::Status expandLocalRange(tent::TransferEngineImpl& engine,
+                                         uint64_t address, size_t length) {
+        return engine.metadata_->segmentManager().updateLocal(
+            [&](tent::SegmentDesc& desc) {
+                auto* buffer = desc.findBuffer(address, 1);
+                if (!buffer)
+                    return tent::Status::InvalidArgument("missing test range");
+                buffer->length = length;
+                return tent::Status::OK();
+            });
+    }
     static size_t queuedOwners(tent::TransferEngineImpl& engine) {
         return engine.queued_owners_.size();
     }
@@ -1010,12 +1021,6 @@ class RangeOnlyRecordingTransport : public FakeTransport {
     static constexpr uint64_t kRange = uint64_t{1} << 34;
     std::vector<Request> posted;
 
-    Status addMemoryBuffer(BufferDesc& desc,
-                           const MemoryOptions& options) override {
-        // Only the descriptor is large. The fake never accesses its payload.
-        desc.length = kRange;
-        return FakeTransport::addMemoryBuffer(desc, options);
-    }
     Status submitTransferTasks(SubBatchRef batch,
                                const std::vector<Request>& requests) override {
         posted.insert(posted.end(), requests.begin(), requests.end());
@@ -1049,6 +1054,12 @@ TEST(RuntimeQueueDispatch, TcpCapsPreservePublicMappingAndOwnerBytes) {
                 engine.swapTransportForTest(type, fake);
                 ASSERT_TRUE(
                     engine.registerLocalMemory(buffer.data(), buffer.size())
+                        .ok());
+                // The provider must not mutate the admitted registration
+                // range. Expand only the synthetic metadata after registration.
+                ASSERT_TRUE(
+                    TransferEngineImplTestPeer::expandLocalRange(
+                        engine, addr, RangeOnlyRecordingTransport::kRange)
                         .ok());
                 std::vector<Request> requests;
                 uint64_t offset = 0;

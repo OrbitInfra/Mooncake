@@ -933,3 +933,39 @@ if(USE_MLU)
     "-Wl,--wrap=cnQueryNotifier"
     "-Wl,--wrap=cnQueryQueue")
 endif()
+
+# OrbitKV consumes the shared C ABI without linking the C++ engine.
+add_executable(tent_orbitkv_abi_test orbitkv_abi_test.cpp)
+target_link_libraries(tent_orbitkv_abi_test PRIVATE tent_interface gtest
+                                                    gtest_main ${CMAKE_DL_LIBS})
+target_compile_definitions(
+  tent_orbitkv_abi_test PRIVATE TENT_SHARED_PATH="$<TARGET_FILE:tent_shared>")
+add_dependencies(tent_orbitkv_abi_test tent_shared)
+add_test(NAME tent_orbitkv_abi_test COMMAND tent_orbitkv_abi_test)
+
+if(USE_CUDA
+   AND UNIX
+   AND NOT APPLE)
+  add_executable(tent_orbitkv_cuda_ownership_test
+                 orbitkv_cuda_ownership_test.cpp)
+  target_link_libraries(tent_orbitkv_cuda_ownership_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  foreach(
+    symbol
+    cuInit
+    cuPointerGetAttributes
+    cuCtxGetCurrent
+    cuCtxSetCurrent
+    cudaGetDevice
+    cudaGetDeviceCount
+    cudaSetDevice
+    cudaStreamCreateWithFlags
+    cudaStreamDestroy
+    cudaMemcpyAsync
+    cudaStreamSynchronize)
+    target_link_options(tent_orbitkv_cuda_ownership_test PRIVATE
+                        "-Wl,--wrap=${symbol}")
+  endforeach()
+  add_test(NAME tent_orbitkv_cuda_ownership_test
+           COMMAND tent_orbitkv_cuda_ownership_test)
+endif()

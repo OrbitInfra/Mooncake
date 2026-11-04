@@ -59,6 +59,11 @@ namespace mooncake {
 
 class TransferEngineImplTestPeer {
    public:
+    static void enableSimulatedDeviceStaging(tent::TransferEngineImpl& engine) {
+        // This fixture simulates a device path, so CPU-only drain receipts
+        // cannot be offered and auxiliary staging RPCs must remain available.
+        engine.metadata_->markSourceReady(false);
+    }
     static tent::Status setCachedPeerBufferToMlu(
         tent::TransferEngineImpl& engine, tent::SegmentID peer,
         uint64_t address, size_t length) {
@@ -1755,6 +1760,8 @@ TEST(EngineFailoverE2E, MergedStagingRequestsShareOneSubmission) {
                     initiator.registerLocalMemory(local.data(), kLength).ok());
                 ASSERT_TRUE(
                     target.registerLocalMemory(remote.data(), kLength).ok());
+                TransferEngineImplTestPeer::enableSimulatedDeviceStaging(
+                    target);
                 SegmentID peer;
                 ASSERT_TRUE(
                     initiator.openSegment(peer, target.getSegmentName()).ok());

@@ -50,6 +50,15 @@ __wrap__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
 namespace mooncake {
 class TransferEngineImplTestPeer {
    public:
+    static std::vector<tent::BufferDesc> retiredBuffers(
+        tent::TransferEngineImpl& engine) {
+        std::vector<tent::BufferDesc> result;
+        std::lock_guard<std::mutex> lock(engine.retired_registration_mutex_);
+        for (const auto& [key, owner] : engine.retired_registrations_)
+            result.push_back(owner.desc);
+        return result;
+    }
+
     static std::vector<tent::BufferDesc> localBuffers(
         tent::TransferEngineImpl& engine) {
         const auto local = engine.metadata_->segmentManager().getLocal();
@@ -93,6 +102,10 @@ class FailOnceRemoveTransport : public Transport {
     }
     Status removeMemoryBuffer(BufferDesc& desc) override {
         ++remove_calls;
+        if (fail_removes > 0) {
+            --fail_removes;
+            return Status::InternalError("injected repeated drain failure");
+        }
         if (std::exchange(fail, false))
             return Status::InternalError("injected drain failure");
         desc.transports.erase(
@@ -114,6 +127,7 @@ class FailOnceRemoveTransport : public Transport {
     const char* getName() const override { return "fail-once-remove"; }
     TransportType type;
     bool fail;
+    int fail_removes = 0;
     int remove_calls = 0, allocate_calls = 0, free_calls = 0;
 };
 
@@ -309,7 +323,9 @@ TEST(LocalMemoryLifecycle, FailedUnregisterRetainsRegistrationForRetry) {
         EXPECT_FALSE(unregister().ok());
         SegmentInfo info;
         ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
-        ASSERT_EQ(info.buffers.size(), 1u);
+        EXPECT_TRUE(info.buffers.empty());
+        EXPECT_EQ(TransferEngineImplTestPeer::retiredBuffers(engine).size(),
+                  1u);
         EXPECT_EQ(rdma->remove_calls, 1);
         EXPECT_EQ(mlu->remove_calls, 1);
         EXPECT_TRUE(unregister().ok());
@@ -382,26 +398,29 @@ TEST(LocalMemoryLifecycle, StageMetadataFailureRetainsMemoryIfRollbackFails) {
     TransferEngineImpl engine(makeConfig());
     ASSERT_TRUE(engine.available());
     auto tcp = std::make_shared<FailOnceRemoveTransport>(TCP, true);
+    tcp->fail = false;
+    tcp->fail_removes = 2;
     auto mlu = std::make_shared<FailOnceRemoveTransport>(MLU);
     engine.swapTransportForTest(TCP, tcp);
     engine.swapTransportForTest(MLU, mlu);
     ProxyManager proxy(&engine, 4096, 2);
     fail_next_segment_sync = true;
     uint64_t address = 0;
-    EXPECT_TRUE(proxy.pinStageBuffer("cpu:0", address).IsMetadataError());
+    EXPECT_FALSE(proxy.pinStageBuffer("cpu:0", address).ok());
     EXPECT_EQ(mlu->free_calls, 0);
-    EXPECT_EQ(tcp->remove_calls, 1);
+    EXPECT_EQ(tcp->remove_calls, 2);
     EXPECT_EQ(mlu->remove_calls, 1);
     SegmentInfo info;
     ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
     EXPECT_TRUE(info.buffers.empty());
-    const auto buffers = TransferEngineImplTestPeer::localBuffers(engine);
+    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
+    const auto buffers = TransferEngineImplTestPeer::retiredBuffers(engine);
     ASSERT_EQ(buffers.size(), 1u);
     EXPECT_TRUE(buffers.front().internal);
     void* retained = reinterpret_cast<void*>(buffers.front().addr);
     // A failed rollback remains owned by the engine and can be retried safely.
     EXPECT_TRUE(engine.unregisterLocalMemory(retained).ok());
-    EXPECT_EQ(tcp->remove_calls, 2);
+    EXPECT_EQ(tcp->remove_calls, 3);
     EXPECT_EQ(mlu->remove_calls, 1);
     EXPECT_TRUE(engine.freeLocalMemory(retained).ok());
     EXPECT_EQ(mlu->free_calls, 1);
@@ -438,6 +457,78 @@ TEST(LocalMemoryLifecycle, StagePoolSelectsAllocatorFromLocalTransports) {
         EXPECT_EQ(tcp->remove_calls, 1);
         EXPECT_EQ(mlu->remove_calls, with_mlu ? 1 : 0);
     }
+}
+
+class PartialRegistrationTransport : public FailOnceRemoveTransport {
+   public:
+    PartialRegistrationTransport() : FailOnceRemoveTransport(RDMA) {}
+    Status addMemoryBuffer(BufferDesc& desc,
+                           const MemoryOptions& options) override {
+        auto status = FailOnceRemoveTransport::addMemoryBuffer(desc, options);
+        return fail_registration
+                   ? Status::RdmaError("injected partial registration")
+                   : status;
+    }
+    bool fail_registration = true;
+};
+
+TEST(LocalMemoryLifecycle, FailedRegistrationRetainsOwnerAndRetriesCleanup) {
+    TransferEngineImpl engine(makeConfig());
+    ASSERT_TRUE(engine.available());
+    auto transport = std::make_shared<PartialRegistrationTransport>();
+    engine.swapTransportForTest(RDMA, transport);
+    std::vector<char> buffer(4096);
+    MemoryOptions options;
+    options.type = RDMA;
+    transport->fail_removes = 2;
+    EXPECT_FALSE(
+        engine.registerLocalMemory({buffer.data()}, {buffer.size()}, options)
+            .ok());
+    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
+    EXPECT_EQ(TransferEngineImplTestPeer::retiredBuffers(engine).size(), 1u);
+    EXPECT_FALSE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::retiredBuffers(engine).size(), 1u);
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    EXPECT_TRUE(TransferEngineImplTestPeer::retiredBuffers(engine).empty());
+    transport->fail_registration = false;
+    ASSERT_TRUE(
+        engine.registerLocalMemory({buffer.data()}, {buffer.size()}, options)
+            .ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(LocalMemoryLifecycle, DuplicateOptionsAndFailedBatchPreserveReferences) {
+    TransferEngineImpl engine(makeConfig());
+    ASSERT_TRUE(engine.available());
+    auto transport = std::make_shared<PartialRegistrationTransport>();
+    transport->fail_registration = false;
+    engine.swapTransportForTest(RDMA, transport);
+    std::vector<char> first(4096), second(4096);
+    MemoryOptions options;
+    options.type = RDMA;
+    ASSERT_TRUE(
+        engine.registerLocalMemory({first.data()}, {first.size()}, options)
+            .ok());
+    auto changed = options;
+    changed.perm = kGlobalReadOnly;
+    EXPECT_FALSE(
+        engine.registerLocalMemory({first.data()}, {first.size()}, changed)
+            .ok());
+    transport->fail_registration = true;
+    EXPECT_FALSE(engine
+                     .registerLocalMemory({first.data(), second.data()},
+                                          {first.size(), second.size()},
+                                          options)
+                     .ok());
+    const auto live = TransferEngineImplTestPeer::localBuffers(engine);
+    ASSERT_EQ(live.size(), 1u);
+    EXPECT_EQ(live.front().addr, reinterpret_cast<uint64_t>(first.data()));
+    EXPECT_EQ(live.front().ref_count, 1);
+    EXPECT_TRUE(TransferEngineImplTestPeer::retiredBuffers(engine).empty());
+    EXPECT_TRUE(engine.unregisterLocalMemory(first.data(), first.size()).ok());
 }
 
 }  // namespace

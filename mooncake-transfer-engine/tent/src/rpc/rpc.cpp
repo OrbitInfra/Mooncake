@@ -164,7 +164,8 @@ Status CoroRpcAgent::start(uint16_t& port, bool ipv6, size_t threads) {
 uint64_t CoroRpcAgent::closeDispatch(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> guard(dispatch_mutex_);
     dispatch_closed_ = true;
-    dispatch_cv_.wait_for(guard, timeout, [this] { return dispatch_active_ == 0; });
+    dispatch_cv_.wait_for(guard, timeout,
+                          [this] { return dispatch_active_ == 0; });
     return dispatch_active_;
 }
 
@@ -178,7 +179,8 @@ Status CoroRpcAgent::stop() {
     {
         std::unique_lock<std::mutex> guard(dispatch_mutex_);
         dispatch_closed_ = true;
-        // Keep I/O alive until queued global-executor handlers resume and finish.
+        // Keep I/O alive until queued global-executor handlers resume and
+        // finish.
         dispatch_cv_.wait(guard, [this] { return dispatch_active_ == 0; });
     }
     if (server_) {
@@ -200,7 +202,8 @@ Lazy<void> CoroRpcAgent::process(int func_id) {
     {
         std::lock_guard<std::mutex> guard(dispatch_mutex_);
         if (dispatch_closed_ || dispatch_active_ == UINT64_MAX) {
-            ctx->set_response_attachment(std::string("RPC dispatch admission closed"));
+            ctx->set_response_attachment(
+                std::string("RPC dispatch admission closed"));
             co_return;
         }
         ++dispatch_active_;

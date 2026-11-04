@@ -255,7 +255,8 @@ static void insertFallbackMemEntry(int nic_list_count,
 Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
                            std::vector<Topology::MemEntry>& mem_list) {
     if (!ensureCudaDriverInit()) {
-        return Status::CudaError("CUDA driver initialization failed before transport admission");
+        return Status::CudaError(
+            "CUDA driver initialization failed before transport admission");
     }
     int count = 0;
     CHECK_CUDA(cudaGetDeviceCount(&count));

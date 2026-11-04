@@ -149,6 +149,7 @@ class TcpRegression : public testing::Test {
                             buffer.addr =
                                 reinterpret_cast<uint64_t>(data.data());
                             buffer.length = data.size();
+                            buffer.source_epoch = sourceEpoch();
                             std::get<MemorySegmentDesc>(desc.detail)
                                 .buffers.push_back(buffer);
                             return Status::OK();
@@ -165,6 +166,12 @@ class TcpRegression : public testing::Test {
             EXPECT_TRUE(
                 engine->unregisterLocalMemory(data.data(), data.size()).ok());
         }
+    }
+
+    std::string sourceEpoch() {
+        std::array<char, 33> epoch{};
+        EXPECT_EQ(engine->sourceEpoch(epoch.data(), epoch.size()), 0);
+        return epoch.data();
     }
 
     Request writeRequest(size_t length = 16) {
@@ -254,7 +261,7 @@ TEST_F(TcpRegression, ServerChecksEveryRegistrationPermission) {
             // Direct RPC bypasses client-side registration/routing policy.
             auto status = call(engine->getSegmentName(),
                                reinterpret_cast<uint64_t>(data.data()),
-                               local.data(), local.size());
+                               local.data(), local.size(), sourceEpoch());
             EXPECT_EQ(status.ok(), allowed) << status.ToString();
             if (!allowed) {
                 EXPECT_NE(status.ToString().find("permission denied"),
@@ -286,7 +293,9 @@ TEST_F(TcpRegression, PayloadCapsRejectBeforeAllocationOrDataRpc) {
     uint16_t port = 0;
     ASSERT_TRUE(receiver.start(port).ok());
     auto address = "127.0.0.1:" + std::to_string(port);
-    ASSERT_TRUE(ControlClient::sendData(address, 0, data.data(), 1).ok());
+    ASSERT_TRUE(
+        ControlClient::sendData(address, 0, data.data(), 1, sourceEpoch())
+            .ok());
     ASSERT_EQ(calls.load(), 1);
     calls = 0;
     injected_failures = 0;
@@ -298,7 +307,7 @@ TEST_F(TcpRegression, PayloadCapsRejectBeforeAllocationOrDataRpc) {
             EXPECT_NO_THROW({
                 EXPECT_TRUE(call(address,
                                  reinterpret_cast<uint64_t>(data.data()),
-                                 data.data(), length)
+                                 data.data(), length, sourceEpoch())
                                 .IsInvalidArgument());
             });
         }
@@ -317,7 +326,9 @@ TEST_F(TcpRegression, MalformedWriteLengthCannotOverflowOrModifyTarget) {
     for (size_t length : {size_t{1}, kTcpMaxWriteBytes + 1,
                           std::numeric_limits<size_t>::max()}) {
         XferDataDesc header{htole64(reinterpret_cast<uint64_t>(data.data())),
-                            htole64(length)};
+                            htole64(length),
+                            {}};
+        memcpy(header.source_epoch, sourceEpoch().c_str(), 33);
         std::string request(reinterpret_cast<char*>(&header), sizeof(header));
         std::string response;
         ASSERT_TRUE(
@@ -326,6 +337,81 @@ TEST_F(TcpRegression, MalformedWriteLengthCannotOverflowOrModifyTarget) {
         EXPECT_EQ(response, "SendData failed: invalid request size");
         EXPECT_EQ(data, original);
     }
+}
+
+TEST_F(TcpRegression, StaleEpochCannotReadOrWriteAndCloseIsPermanent) {
+    const auto epoch = sourceEpoch();
+    const std::string stale(32, epoch[0] == 'a' ? 'b' : 'a');
+    data.fill('S');
+    std::array<char, 16> local;
+    local.fill('L');
+    for (auto call : {ControlClient::recvData, ControlClient::sendData}) {
+        EXPECT_FALSE(call(engine->getSegmentName(),
+                          reinterpret_cast<uint64_t>(data.data()), local.data(),
+                          local.size(), stale)
+                         .ok());
+        EXPECT_EQ(data[0], 'S');
+        EXPECT_EQ(local[0], 'L');
+    }
+    EXPECT_FALSE(engine->validateRemoteEpoch(LOCAL_SEGMENT_ID, stale).ok());
+    EXPECT_TRUE(engine->validateRemoteEpoch(LOCAL_SEGMENT_ID, epoch).ok());
+    std::array<char, 33> receipt{};
+    uint64_t active = 99;
+    ASSERT_EQ(engine->closeSource(1000, receipt.data(), &active), 0);
+    EXPECT_EQ(active, 0u);
+    EXPECT_EQ(std::string(receipt.data()), epoch);
+    EXPECT_FALSE(
+        ControlClient::sendData(engine->getSegmentName(),
+                                reinterpret_cast<uint64_t>(data.data()),
+                                local.data(), local.size(), epoch)
+            .ok());
+    EXPECT_EQ(data[0], 'S');
+    EXPECT_FALSE(engine->registerLocalMemory(local.data(), local.size()).ok());
+    EXPECT_EQ(engine->closeSource(0, receipt.data(), &active), 0);
+}
+
+TEST_F(TcpRegression, ExpectedEpochIsCheckedBeforeTcpRead) {
+    auto request = writeRequest();
+    request.opcode = Request::READ;
+    request.expected_source_epoch = std::string(32, 'x');
+    auto batch = engine->allocateBatch(1);
+    ASSERT_TRUE(engine->submitTransfer(batch, {request}).ok());
+    TcpTransportTestPeer::drain(*tcp);
+    TransferStatus status{};
+    ASSERT_TRUE(engine->getTransferStatus(batch, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_EQ(status.transferred_bytes, 0u);
+    EXPECT_TRUE(engine->freeBatch(batch).ok());
+}
+
+TEST(RpcDispatchDrain, TimeoutRetainsActiveHandlerUntilItFinishes) {
+    CoroRpcAgent receiver;
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    ASSERT_TRUE(receiver
+                    .registerFunction(SendData,
+                                      [&](const auto&, auto&) {
+                                          entered.set_value();
+                                          released.wait();
+                                      })
+                    .ok());
+    uint16_t port = 0;
+    ASSERT_TRUE(receiver.start(port).ok());
+    auto call = std::async(std::launch::async, [&] {
+        CoroRpcAgent client;
+        std::string response;
+        return client.call("127.0.0.1:" + std::to_string(port), SendData, "",
+                           response);
+    });
+    auto ready = entered.get_future().wait_for(5s);
+    EXPECT_EQ(ready, std::future_status::ready);
+    if (ready == std::future_status::ready) {
+        EXPECT_EQ(receiver.closeDispatch(0ms), 1u);
+    }
+    release.set_value();
+    EXPECT_TRUE(call.get().ok());
+    EXPECT_EQ(receiver.closeDispatch(5s), 0u);
+    EXPECT_TRUE(receiver.stop().ok());
 }
 
 }  // namespace

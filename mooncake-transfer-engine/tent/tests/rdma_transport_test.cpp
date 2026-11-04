@@ -5573,6 +5573,7 @@ struct FakeMrVerbs {
     // Registrations the fake refuses: NIC index, and either any address
     // (nullptr) or one specific buffer.
     std::atomic<int> fail_nic{-1};
+    std::atomic<int> fail_dereg_nic{-1};
     void* fail_addr = nullptr;
 
     int nicOf(ibv_pd* p) const { return p == &pd[0] ? 0 : 1; }
@@ -5602,7 +5603,12 @@ ibv_mr* fakeRegMr(ibv_pd* pd, void* addr, size_t length, int) {
 }
 
 int fakeDeregMr(ibv_mr* mr) {
-    fake_mr.dereg_calls[fake_mr.nicOf(mr)]++;
+    const auto nic = fake_mr.nicOf(mr);
+    fake_mr.dereg_calls[nic]++;
+    if (fake_mr.fail_dereg_nic == nic) {
+        errno = EIO;
+        return -1;
+    }
     return 0;
 }
 
@@ -5723,6 +5729,40 @@ TEST_F(RdmaBufferRegistrationTest,
     ASSERT_EQ(desc.rkey.size(), 2u);
     EXPECT_NE(desc.rkey[0], 0u);
     EXPECT_NE(desc.rkey[1], 0u);
+}
+
+TEST_F(RdmaBufferRegistrationTest, FailedRollbackKeepsBothMrOwnersUntilRetry) {
+    fake_mr.fail_nic = 1;
+    fake_mr.fail_dereg_nic = 0;
+    auto desc = describe(buffer_a_, sizeof(buffer_a_));
+    EXPECT_FALSE(manager_.addBuffer(desc, options_).ok());
+    EXPECT_TRUE(manager_.tracksBuffer(desc));
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 1u);
+    EXPECT_TRUE(desc.transports.empty());
+    EXPECT_FALSE(manager_.removeBuffer(desc).ok());
+    EXPECT_TRUE(manager_.tracksBuffer(desc));
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 1u);
+    fake_mr.fail_dereg_nic = -1;
+    EXPECT_TRUE(manager_.removeBuffer(desc).ok());
+    EXPECT_FALSE(manager_.tracksBuffer(desc));
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 0u);
+    EXPECT_TRUE(desc.rkey.empty());
+}
+
+TEST_F(RdmaBufferRegistrationTest, ClearAndDisableKeepFailedMrOwners) {
+    auto desc = describe(buffer_a_, sizeof(buffer_a_));
+    ASSERT_TRUE(manager_.addBuffer(desc, options_).ok());
+    fake_mr.fail_dereg_nic = 0;
+    EXPECT_FALSE(manager_.clear().ok());
+    EXPECT_TRUE(manager_.tracksBuffer(desc));
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 1u);
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[1]), 0u);
+    EXPECT_NE(contexts_[0]->disable(), 0);
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 1u);
+    fake_mr.fail_dereg_nic = -1;
+    EXPECT_TRUE(manager_.clear().ok());
+    EXPECT_FALSE(manager_.tracksBuffer(desc));
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 0u);
 }
 
 TEST_F(RdmaBufferRegistrationTest, ABatchWithOneFailureRegistersNothing) {

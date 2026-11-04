@@ -243,7 +243,7 @@ class RdmaContext {
     // Release every resource currently owned by this context. This is
     // intentionally state-independent so it can clean up a partially completed
     // enable() and can safely be retried.
-    void cleanupResources();
+    int cleanupResources();
 
    private:
     // initialized during ctor, will never be changed during the context's

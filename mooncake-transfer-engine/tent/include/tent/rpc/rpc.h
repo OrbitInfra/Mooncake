@@ -120,12 +120,13 @@ class CoroRpcAgent {
    private:
     class DispatchGuard {
        public:
-        explicit DispatchGuard(CoroRpcAgent& owner) : owner_(owner) {}
+        explicit DispatchGuard(CoroRpcAgent &owner) : owner_(owner) {}
         ~DispatchGuard() { owner_.finishDispatch(); }
-        DispatchGuard(const DispatchGuard&) = delete;
-        DispatchGuard& operator=(const DispatchGuard&) = delete;
+        DispatchGuard(const DispatchGuard &) = delete;
+        DispatchGuard &operator=(const DispatchGuard &) = delete;
+
        private:
-        CoroRpcAgent& owner_;
+        CoroRpcAgent &owner_;
     };
     void finishDispatch();
     std::mutex dispatch_mutex_;

@@ -116,7 +116,8 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     int destination_device = -1, source_device = -1;
     CHECK_STATUS(cudaPointerDevice(dst, destination_device));
     CHECK_STATUS(cudaPointerDevice(src, source_device));
-    const int device_id = destination_device >= 0 ? destination_device : source_device;
+    const int device_id =
+        destination_device >= 0 ? destination_device : source_device;
     if (device_id < 0) {
         ::memcpy(dst, src, length);
         return Status::OK();
@@ -124,7 +125,8 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
 
     constexpr size_t max_copy_calls = 64;
     constexpr size_t max_copy_bytes = size_t{1} << 30;
-    if (length > max_copy_bytes) return Status::TooManyRequests("CUDA copy byte admission");
+    if (length > max_copy_bytes)
+        return Status::TooManyRequests("CUDA copy byte admission");
     const size_t calls = copy_calls_.fetch_add(1, std::memory_order_relaxed);
     if (calls >= max_copy_calls) {
         copy_calls_.fetch_sub(1, std::memory_order_relaxed);
@@ -136,7 +138,9 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
             copy_calls_.fetch_sub(1, std::memory_order_relaxed);
             return Status::TooManyRequests("CUDA copy byte admission");
         }
-        if (copy_bytes_.compare_exchange_weak(bytes, bytes + length, std::memory_order_relaxed)) break;
+        if (copy_bytes_.compare_exchange_weak(bytes, bytes + length,
+                                              std::memory_order_relaxed))
+            break;
     }
     struct CopyAdmission {
         std::atomic<size_t>& calls;
@@ -184,7 +188,8 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
                 // CUDA errors may report preceding async work. Keep the stream,
                 // admitted bytes and the caller's RPC scratch alive.
                 constexpr char message[] =
-                    "TENT: CUDA copy termination unproven; retaining stream, buffers and admission\n";
+                    "TENT: CUDA copy termination unproven; retaining stream, "
+                    "buffers and admission\n";
                 (void)::write(STDERR_FILENO, message, sizeof(message) - 1);
                 while (true) (void)::poll(nullptr, 0, -1);
             }
@@ -202,7 +207,8 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     const CUresult restore_rc = cuCtxSetCurrent(caller_ctx);
     if (restore_failed || restore_rc != CUDA_SUCCESS) {
         constexpr char message[] =
-            "TENT: CUDA context restoration failed; retaining worker and copy admission\n";
+            "TENT: CUDA context restoration failed; retaining worker and copy "
+            "admission\n";
         (void)::write(STDERR_FILENO, message, sizeof(message) - 1);
         while (true) (void)::poll(nullptr, 0, -1);
     }

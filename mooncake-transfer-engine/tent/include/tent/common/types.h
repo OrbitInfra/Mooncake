@@ -176,8 +176,8 @@ struct Request {
     // (transports/rdma/deadline_bw_arbitration). See RFC #2519, RFC #2792
     // and docs/source/design/tent/deadline-scheduling.md.
     uint64_t deadline_ns = 0;
-    std::string expected_source_epoch;
     IntentType intent_type = IntentType::INTENT_UNSPEC;
+    std::string expected_source_epoch;
 };
 
 enum TransferStatusEnum {

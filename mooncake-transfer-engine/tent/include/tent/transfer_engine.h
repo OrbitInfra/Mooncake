@@ -142,8 +142,8 @@ void tent_destroy_engine(tent_engine_t engine);
 // 0: drained; 1: still owned; 2: unsupported physical path; -1: error.
 // epoch points to 33 bytes; active is observed after the bounded wait.
 // This does not drain requester batches or authorize individual ticket reuse.
-int tent_close_source(tent_engine_t engine, uint64_t timeout_ms,
-                      char* epoch, uint64_t* active);
+int tent_close_source(tent_engine_t engine, uint64_t timeout_ms, char* epoch,
+                      uint64_t* active);
 
 int tent_source_epoch(tent_engine_t engine, char* epoch, size_t capacity);
 int tent_validate_remote_epoch(tent_engine_t engine, tent_segment_id_t segment,

@@ -65,15 +65,19 @@ inline Status cudaPointerDevice(const void* ptr, int& device) {
         CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
     };
     void* values[] = {&memory_type, &ordinal};
-    auto result = cuPointerGetAttributes(2, attributes, values, (CUdeviceptr)ptr);
+    auto result =
+        cuPointerGetAttributes(2, attributes, values, (CUdeviceptr)ptr);
     if (result != CUDA_SUCCESS) {
         return Status::CudaError("CUDA pointer attributes query failed: " +
                                  std::to_string(result));
     }
-    if (memory_type == 0 || memory_type == CU_MEMORYTYPE_HOST) return Status::OK();
-    if ((memory_type != CU_MEMORYTYPE_DEVICE && memory_type != CU_MEMORYTYPE_UNIFIED) ||
+    if (memory_type == 0 || memory_type == CU_MEMORYTYPE_HOST)
+        return Status::OK();
+    if ((memory_type != CU_MEMORYTYPE_DEVICE &&
+         memory_type != CU_MEMORYTYPE_UNIFIED) ||
         ordinal < 0) {
-        return Status::CudaError("Unsupported CUDA pointer memory type or device");
+        return Status::CudaError(
+            "Unsupported CUDA pointer memory type or device");
     }
     device = ordinal;
     return Status::OK();

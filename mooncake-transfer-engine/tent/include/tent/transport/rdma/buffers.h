@@ -97,7 +97,7 @@ class LocalBufferManager {
 
     Status removeBuffer(BufferDesc &desc);
 
-    bool tracksBuffer(const BufferDesc &desc);
+    bool tracksBuffer(const BufferDesc &desc) const;
 
     Status addDevice(RdmaContext *context);
 

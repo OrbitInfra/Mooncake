@@ -461,20 +461,26 @@ int RdmaContext::disable() {
         return -1;
     }
 
-    cleanupResources();
+    if (cleanupResources()) return -1;
     status_ = DEVICE_DISABLED;
     return 0;
 }
 
-void RdmaContext::cleanupResources() {
+int RdmaContext::cleanupResources() {
     {
         std::lock_guard<std::mutex> lock(mr_set_mutex_);
-        for (auto& entry : mr_set_) {
-            int ret = verbs_.ibv_dereg_mr(entry);
-            if (ret) PLOG(ERROR) << "ibv_dereg_mr";
+        for (auto it = mr_set_.begin(); it != mr_set_.end();) {
+            auto* entry = *it;
+            if (verbs_.ibv_dereg_mr(entry)) {
+                PLOG(ERROR)
+                    << "ibv_dereg_mr; retaining MR and device resources";
+                ++it;
+            } else {
+                dmabuf_mr_set_.erase(entry);
+                it = mr_set_.erase(it);
+            }
         }
-        mr_set_.clear();
-        dmabuf_mr_set_.clear();
+        if (!mr_set_.empty()) return -1;
     }
     for (auto& entry : cq_list_) {
         delete entry;
@@ -508,6 +514,7 @@ void RdmaContext::cleanupResources() {
             PLOG(ERROR) << "ibv_close_device";
         native_context_ = nullptr;
     }
+    return 0;
 }
 
 int RdmaContext::pause() {

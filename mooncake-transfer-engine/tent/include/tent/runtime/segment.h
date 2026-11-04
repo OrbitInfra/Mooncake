@@ -87,7 +87,8 @@ struct BufferDesc {
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(BufferDesc, addr, length, location,
                                    transports, regions, transport_attrs, rkey,
-                                   shm_path, mnnvl_handle, internal, source_epoch);
+                                   shm_path, mnnvl_handle, internal,
+                                   source_epoch);
 };
 
 struct FileBufferDesc {

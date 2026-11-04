@@ -460,7 +460,6 @@ class TransferEngineImpl {
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
-
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
     // Submit-stage failover: recover a task whose synchronous
@@ -681,7 +680,7 @@ class TransferEngineImpl {
     void releasePublishedPrefixes(const std::vector<void*>& addresses,
                                   size_t count);
     Status unregisterLocalMemoryLocked(void* addr, size_t size,
-                                      bool synchronize = true);
+                                       bool synchronize = true);
     RegistrationCoordinator registration_coordinator_;
     std::mutex retired_registration_mutex_;
     std::map<std::pair<uint64_t, uint64_t>, RetiredRegistration>

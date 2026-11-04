@@ -59,20 +59,25 @@ void tent_destroy_engine(tent_engine_t engine) {
     }
 }
 
-int tent_close_source(tent_engine_t engine, uint64_t timeout_ms,
-                      char* epoch, uint64_t* active) {
+int tent_close_source(tent_engine_t engine, uint64_t timeout_ms, char* epoch,
+                      uint64_t* active) {
     CHECK_POINTER(engine);
     CHECK_POINTER(epoch);
     CHECK_POINTER(active);
     try {
         return CAST(engine)->closeSource(timeout_ms, epoch, active);
-    } catch (...) { return -1; }
+    } catch (...) {
+        return -1;
+    }
 }
 
 int tent_source_epoch(tent_engine_t engine, char* epoch, size_t capacity) {
     CHECK_POINTER(engine);
-    try { return CAST(engine)->sourceEpoch(epoch, capacity); }
-    catch (...) { return -1; }
+    try {
+        return CAST(engine)->sourceEpoch(epoch, capacity);
+    } catch (...) {
+        return -1;
+    }
 }
 
 int tent_validate_remote_epoch(tent_engine_t engine, tent_segment_id_t segment,
@@ -80,8 +85,12 @@ int tent_validate_remote_epoch(tent_engine_t engine, tent_segment_id_t segment,
     CHECK_POINTER(engine);
     CHECK_POINTER(expected);
     if (strnlen(expected, 33) != 32) return -1;
-    try { return CAST(engine)->validateRemoteEpoch(segment, expected).ok() ? 0 : -1; }
-    catch (...) { return -1; }
+    try {
+        return CAST(engine)->validateRemoteEpoch(segment, expected).ok() ? 0
+                                                                         : -1;
+    } catch (...) {
+        return -1;
+    }
 }
 
 int tent_segment_name(tent_engine_t engine, char* buf, size_t buf_len) {
@@ -244,9 +253,11 @@ int tent_submit(tent_engine_t engine, tent_batch_id_t batch_id,
         req_list[index].priority = entries[index].priority;
         req_list[index].transport_hint =
             mooncake::tent::c_to_transport_hint(entries[index].transport_hint);
-        const auto epoch_size = strnlen(entries[index].expected_source_epoch, 33);
+        const auto epoch_size =
+            strnlen(entries[index].expected_source_epoch, 33);
         if (epoch_size != 0 && epoch_size != 32) return -1;
-        req_list[index].expected_source_epoch.assign(entries[index].expected_source_epoch, epoch_size);
+        req_list[index].expected_source_epoch.assign(
+            entries[index].expected_source_epoch, epoch_size);
     }
     auto status = CAST(engine)->submitTransfer(batch_id, req_list);
     if (!status.ok()) {
@@ -275,9 +286,11 @@ int tent_submit_notif(tent_engine_t engine, tent_batch_id_t batch_id,
         req_list[index].priority = entries[index].priority;
         req_list[index].transport_hint =
             mooncake::tent::c_to_transport_hint(entries[index].transport_hint);
-        const auto epoch_size = strnlen(entries[index].expected_source_epoch, 33);
+        const auto epoch_size =
+            strnlen(entries[index].expected_source_epoch, 33);
         if (epoch_size != 0 && epoch_size != 32) return -1;
-        req_list[index].expected_source_epoch.assign(entries[index].expected_source_epoch, epoch_size);
+        req_list[index].expected_source_epoch.assign(
+            entries[index].expected_source_epoch, epoch_size);
     }
     mooncake::tent::Notification notifi;
     notifi.name = name;
