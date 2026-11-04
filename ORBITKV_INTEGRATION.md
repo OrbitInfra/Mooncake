@@ -94,11 +94,13 @@ runner. `tent_orbitkv_abi_test` checks all 23 consumed C symbols, signatures, an
 
 [The fork workflow](.github/workflows/orbitkv-integration.yml) defines both Linux
 configurations and artifact uploads for configuration, build logs, CTest logs,
-and per-case XML. During this upgrade, GitHub rejected dispatch with HTTP 422,
-`Actions has been disabled for this repository`; no Actions job ran. The
-permissions endpoint nevertheless returned `enabled: true`. Local Linux
-containers supplied the results below. Inspect skipped GoogleTest cases as
-well as the CTest summary. Hardware
+and per-case XML. After the maintainer enabled fork workflows,
+[x86_64 run 41764539451](https://github.com/OrbitInfra/Mooncake/actions/runs/41764539451)
+passed both configurations at `a6caba7e`: CUDA OFF passed 19/19 CTest invocations
+(451 GoogleTest cases passed, two RDMA cases skipped); CUDA ON passed 3/3 CTest
+invocations (14 injected/ABI cases passed). Inspect skipped GoogleTest cases as
+well as the CTest summary. This normal run does not establish repeated-suite
+reliability; the upstream stress failure below remains unresolved. Hardware
 RDMA, physical CUDA copies/context behavior, multi-GPU copies, and installed
 OrbitKV qualification remain separate hardware gates. A source-close receipt
 only proves whole-source CPU/TCP handler drain, not CUDA/RDMA physical drain or
@@ -121,13 +123,113 @@ redistributions (nvcc 13.0.88, cudart 13.0.96) and driver stubs.
 | macOS native configuration | Stopped at missing CLI11 development headers; no native macOS TENT binary built. |
 | Scoped pre-commit | Applicable checks passed. |
 
-Physical RDMA, CUDA device copies/context behavior, NVLink/multi-GPU execution,
-and x86_64 execution were not tested. GDS was not built because cuFile was
+Physical RDMA, CUDA device copies/context behavior, and NVLink/multi-GPU execution
+were not tested. GDS was not built because cuFile was
 absent. The full repository suite and OrbitKV's installed-runtime/Rust tests
 were not run; this session qualifies the selected TENT paths and leaves the
 OrbitKV pin unchanged. The old three-library runtime was also checked and
 failed to load with `libtent_metrics.so` missing, confirming the packaging
 change below.
+
+### Known upstream issue: TCP tests reuse stale pooled connections
+
+The full `tent_tcp_regression_test --gtest_repeat=200` loop reproduces a
+failure on both this branch at `a6caba7e84b51ee799f3a6c38b09d9b2981edf41` and
+unmodified upstream v0.3.14 at `e1ea5d31bb5e46ff2df9f90e7c2fbaf52fcdee8c`.
+Both completed all 200 repetitions in the same Debian trixie/aarch64 Linux
+container described above, with `--security-opt seccomp=unconfined`, GCC 14.4.0,
+CUDA OFF, and yalantinglibs `45c6463c0afbcc46262e373effa30635be3846a0`.
+No test filter, assertion change, retry, or early break was used.
+
+| Revision | Cases per repetition | Passed case invocations | Failed case invocations | Payload test failures | Permission test failures |
+| --- | --- | --- | --- | --- | --- |
+| OrbitKV `a6caba7e` | 9 | 1759/1800 | 41 | 21; first at repetition 48 | 20; first at repetition 37 |
+| Upstream `e1ea5d31` | 6 | 1163/1200 | 37 | 19; first at repetition 12 | 18; first at repetition 95 |
+
+The originally observed failure is
+`TcpRegression.PayloadCapsRejectBeforeAllocationOrDataRpc`:
+`ASSERT_TRUE(ControlClient::sendData(address, 0, data.data(), 1).ok())`
+at upstream `tcp_regression_test.cpp:289` returns false. The fork's equivalent
+assertion at line 299 also passes `sourceEpoch()`. The other failing case is
+`TcpRegression.ServerChecksEveryRegistrationPermission`: the error text lacks
+`permission denied` (upstream line 260, fork line 270).
+
+`CoroRpcAgent::start()` chooses automatic ports from 15000 through 16999.
+The main thread's `ControlClient` RPC agent and its address-keyed idle connection
+pools outlive each test server. Reusing a stopped server's address can therefore
+select an old connection. A separate two-server diagnostic, linked independently
+against each revision without changing either tree, returned `OK` for the first
+one-byte send, then `RpcServiceError: ... message: End of file` for the first send
+after restarting on the same port. The replacement handler's call count remained
+zero on both revisions. The existing RPC path evicts the stale pool on failure;
+it does not replay this WRITE. This is an upstream issue, not an OrbitKV patch
+regression. No workaround, added retry, or assertion change is carried here.
+
+Reproduction uses the existing local image `orbitinfra-mooncake-validation:v0314`
+(image ID `sha256:414f07ba1d7a25d8191c37c46eca52e74a2fca7ddf8d24fc79cb1d1eed9eab76`).
+The fork build is `.git/validation/build-linux`. Prepare a separate upstream
+checkout and build inside this repository; retain the OrbitKV flags above with
+`BUILD_UNIT_TESTS=ON` and build target `tent_tcp_regression_test`. Upstream's
+standalone entry point needs an external CMake include declaring its CLI11
+dependency, without modifying upstream source or tests:
+
+```bash
+mkdir -p .git/validation/tcp-stress
+git worktree add --detach .git/validation/tcp-stress/upstream \
+  e1ea5d31bb5e46ff2df9f90e7c2fbaf52fcdee8c
+git -C .git/validation/tcp-stress/upstream submodule update --init --recursive
+cat > .git/validation/tcp-stress/upstream-cli11.cmake <<'CMAKE'
+if(PROJECT_NAME STREQUAL "mooncake-transfer-engine")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Dependencies.cmake")
+  mooncake_provide_cli11()
+endif()
+CMAKE
+```
+
+Inside the same image, with the repository mounted at `/workspace`, the upstream
+configuration/build commands are:
+
+```bash
+root=/workspace/.git/validation/tcp-stress
+cmake -S "$root/upstream/mooncake-transfer-engine" -B "$root/build-upstream" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+  '-DCMAKE_BUILD_RPATH=$ORIGIN' '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
+  -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF \
+  -DWITH_RUST_EXAMPLE=OFF -DUSE_HTTP=OFF -DUSE_ETCD=OFF -DUSE_REDIS=OFF \
+  -DUSE_TENT=ON -DWITH_METRICS=OFF -DUSE_CUDA=OFF \
+  -DCMAKE_PROJECT_INCLUDE="$root/upstream-cli11.cmake" \
+  -DFETCHCONTENT_SOURCE_DIR_YALANTINGLIBS=/workspace/.git/validation/build-linux/_deps/yalantinglibs-src
+cmake --build "$root/build-upstream" --target tent_tcp_regression_test --parallel 2
+```
+
+Run each complete suite in one process, keeping failures visible while allowing
+all 200 repetitions to finish. From the host repository directory:
+
+```bash
+for revision in fork upstream; do
+  if [ "$revision" = fork ]; then
+    binary=/workspace/.git/validation/build-linux/tent/tests/tent_tcp_regression_test
+  else
+    binary=/workspace/.git/validation/tcp-stress/build-upstream/tent/tests/tent_tcp_regression_test
+  fi
+  if docker run --rm --security-opt seccomp=unconfined \
+    --mount "type=bind,source=$PWD,target=/workspace" -w /workspace \
+    orbitinfra-mooncake-validation:v0314 "$binary" --gtest_repeat=200 \
+    > ".git/validation/tcp-stress/$revision-200.log" 2>&1; then
+    echo "$revision: exit 0"
+  else
+    echo "$revision: exit $?"
+  fi
+done
+```
+
+Both observed runs exited 1. Failure counts and first failing repetitions depend
+on randomly selected ports. Raw logs and diagnostic sources remain outside Git
+under `.git/validation/tcp-stress/`: `fork-200.log`, `upstream-200.log`,
+`fork-pool-diagnostic.log`, `upstream-pool-diagnostic.log`, and `comparison.json`.
+The SHA-256 digests of the two full-suite logs are respectively
+`0de183c120995f963f78fdb91dd0f8412e4d6fe1e64669f9aa13fee631f4b899` and
+`25ffeb98415198441d189a570e11b9c9d02767681891d8430f54ba2c1ce70c40`.
 
 ## Consuming this branch
 
