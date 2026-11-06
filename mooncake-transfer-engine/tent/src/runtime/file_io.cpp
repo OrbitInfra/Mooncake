@@ -10,6 +10,8 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <thread>
 
@@ -21,6 +23,7 @@ namespace mooncake::tent {
 namespace {
 constexpr size_t kMaxFiles = 256, kMaxBatches = 32, kMaxRanges = 16384;
 constexpr uint64_t kMaxBytes = 64ull << 20, kSliceBytes = 16ull << 20;
+constexpr size_t kStagingWindow = 4ull << 20, kStagingBudget = 64ull << 20;
 constexpr uint64_t kMaxTimeoutMs = 24 * 60 * 60 * 1000;
 using Clock = std::chrono::steady_clock;
 
@@ -63,6 +66,10 @@ struct FileIO::File {
     }
 };
 
+struct FileIO::StagingBudget {
+    std::atomic<size_t> bytes{0};
+};
+
 struct FileIO::Batch {
     std::mutex mutex, join_mutex;
     std::condition_variable changed;
@@ -73,6 +80,14 @@ struct FileIO::Batch {
     tent_file_id_t file_id;
     std::shared_ptr<File> file;
     std::vector<Request> requests;
+    std::vector<tent_file_element_t> elements;
+    std::shared_ptr<Platform> platform;
+    std::shared_ptr<StagingBudget> budget;
+    size_t staging_size{0}, charge{0};
+    void* host_staging{nullptr};
+    void* io_staging{nullptr};
+    BufferDesc staging_desc;
+    bool device_staging{false}, registered{false};
     tent_file_owner_t owner;
     Transport::SubBatchRef native{nullptr};
 #ifdef USE_CUDA
@@ -89,11 +104,90 @@ struct FileIO::Batch {
         uncertain = true;
         changed.notify_all();
     }
+
+    // Called on the worker with the captured GDS context current. Raw staging
+    // pointers deliberately survive any uncertain copy, deregister or free.
+    bool allocateStaging() {
+        if (posix_memalign(&host_staging, 4096, staging_size)) return false;
+        io_staging = host_staging;
+#ifdef USE_CUDA
+        if (file->transport_type == TRANSPORT_GDS) {
+            CUdevice device;
+            CUdeviceptr ptr = 0;
+            if (cuCtxGetDevice(&device) != CUDA_SUCCESS ||
+                cuMemAlloc(&ptr, staging_size) != CUDA_SUCCESS)
+                return false;
+            io_staging = reinterpret_cast<void*>(ptr);
+            device_staging = true;
+            // Never let an unexpected device allocation alignment send the
+            // native-only profile through cuFile's compatibility path.
+            if (file->native_only && ptr % 4096) return false;
+            staging_desc.addr = ptr;
+            staging_desc.length = staging_size;
+            staging_desc.location = "cuda:" + std::to_string(device);
+            MemoryOptions options;
+            options.location = staging_desc.location;
+            // Even a failed registration may have acquired native ownership.
+            if (!file->transport->addMemoryBuffer(staging_desc, options).ok())
+                return false;
+            registered = true;
+        }
+#endif
+        return true;
+    }
+
+    bool copyWindow(uint64_t start, size_t length, bool write) {
+        if (write) {
+            memset(host_staging, 0, length);
+            if (device_staging &&
+                !platform->copy(io_staging, host_staging, length).ok())
+                return false;
+        }
+        uint64_t element_start = 0;
+        for (const auto& element : elements) {
+            const uint64_t end = element_start + element.length;
+            const uint64_t lo = std::max(start, element_start);
+            const uint64_t hi = std::min(start + length, end);
+            if (lo < hi && element.kind == TENT_FILE_ELEMENT_RANGE) {
+                auto* caller =
+                    static_cast<char*>(element.address) + (lo - element_start);
+                auto* scratch = static_cast<char*>(io_staging) + (lo - start);
+                auto status = write ? platform->copy(scratch, caller, hi - lo)
+                                    : platform->copy(caller, scratch, hi - lo);
+                if (!status.ok()) return false;
+            }
+            element_start = end;
+            if (end >= start + length) break;
+        }
+        return true;
+    }
+
+    bool releaseDeviceStaging() {
+        if (registered) {
+            if (!file->transport->removeMemoryBuffer(staging_desc).ok())
+                return false;
+            registered = false;
+        }
+#ifdef USE_CUDA
+        if (device_staging) {
+            if (cuMemFree(reinterpret_cast<CUdeviceptr>(io_staging)) !=
+                CUDA_SUCCESS)
+                return false;
+            device_staging = false;
+            io_staging = nullptr;
+        }
+#endif
+        return true;
+    }
 };
 
 FileIO::FileIO(const tent_file_options_t& options,
                std::shared_ptr<Transport> uring, std::shared_ptr<Transport> gds)
-    : options_(options), uring_(std::move(uring)), gds_(std::move(gds)) {}
+    : options_(options),
+      uring_(std::move(uring)),
+      gds_(std::move(gds)),
+      platform_(&Platform::getLoader(), [](Platform*) {}),
+      staging_budget_(std::make_shared<StagingBudget>()) {}
 
 FileIO::~FileIO() {
     // The C engine destructor refuses destruction while these exist. Native
@@ -128,6 +222,16 @@ std::shared_ptr<Transport> FileIO::replaceUringForTest(
     std::lock_guard<std::mutex> lock(mutex_);
     if (!files_.empty()) return nullptr;
     return std::exchange(uring_, std::move(replacement));
+}
+
+void FileIO::setPlatformForTest(std::shared_ptr<Platform> platform) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (platform && !opening_ && files_.empty() && batches_.empty())
+        platform_ = std::move(platform);
+}
+
+size_t FileIO::stagingBytesForTest() const {
+    return staging_budget_->bytes.load();
 }
 
 int FileIO::open(const char* uri, tent_file_access_t access, int transport,
@@ -202,7 +306,33 @@ int FileIO::open(const char* uri, tent_file_access_t access, int transport,
 int FileIO::submit(tent_file_id_t file_id, int opcode, uint64_t offset,
                    const tent_file_range_t* ranges, size_t count,
                    const tent_file_owner_t& owner, tent_file_batch_t& id) {
-    if (!ranges || !count || count > kMaxRanges || !owner.retain ||
+    if (!ranges || !count || count > kMaxRanges)
+        return TENT_FILE_INVALID_ARGUMENT;
+    bool stage = offset % 4096 != 0;
+    std::vector<tent_file_element_t> elements;
+    elements.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        elements.push_back(
+            {TENT_FILE_ELEMENT_RANGE, ranges[i].address, ranges[i].length});
+        stage |= reinterpret_cast<uintptr_t>(ranges[i].address) % 4096 ||
+                 ranges[i].length % 4096;
+    }
+    return submitElements(file_id, opcode, offset, elements.data(), count,
+                          owner, id, stage);
+}
+
+int FileIO::submitv(tent_file_id_t file_id, int opcode, uint64_t offset,
+                    const tent_file_element_t* elements, size_t count,
+                    const tent_file_owner_t& owner, tent_file_batch_t& id) {
+    return submitElements(file_id, opcode, offset, elements, count, owner, id,
+                          true);
+}
+
+int FileIO::submitElements(tent_file_id_t file_id, int opcode, uint64_t offset,
+                           const tent_file_element_t* elements, size_t count,
+                           const tent_file_owner_t& owner,
+                           tent_file_batch_t& id, bool stage) {
+    if (!elements || !count || count > kMaxRanges || !owner.retain ||
         !owner.release || (opcode != OPCODE_READ && opcode != OPCODE_WRITE))
         return TENT_FILE_INVALID_ARGUMENT;
     std::shared_ptr<File> file;
@@ -223,31 +353,57 @@ int FileIO::submit(tent_file_id_t file_id, int opcode, uint64_t offset,
     batch->owner = owner;
     uint64_t total = 0;
     for (size_t i = 0; i < count; ++i) {
-        const auto& range = ranges[i];
+        const auto& range = elements[i];
         const uintptr_t address = reinterpret_cast<uintptr_t>(range.address);
-        if (!address || !range.length || range.length > kMaxBytes - total ||
-            range.length > UINTPTR_MAX - address)
+        const bool padding = range.kind == TENT_FILE_ELEMENT_PADDING;
+        if ((range.kind != TENT_FILE_ELEMENT_RANGE && !padding) ||
+            (padding ? address != 0 : !address) || !range.length ||
+            range.length > kMaxBytes - total ||
+            (!padding && range.length > UINTPTR_MAX - address))
             return TENT_FILE_INVALID_ARGUMENT;
-        if (file->native_only &&
-            (address % 4096 || range.length % 4096 || offset % 4096 ||
-             !nativeGdsPointer(range.address)))
+        if (file->native_only && !padding && !nativeGdsPointer(range.address))
             return TENT_FILE_INVALID_ARGUMENT;
-        for (uint64_t part = 0; part < range.length;
-             part += file->slice_bytes) {
+        total += range.length;
+    }
+    if (offset > file->length || total > file->length - offset ||
+        (file->native_only && (offset % 4096 || total % 4096)))
+        return TENT_FILE_INVALID_ARGUMENT;
+    if (stage) {
+        batch->elements.assign(elements, elements + count);
+        batch->staging_size =
+            std::min({size_t{total}, kStagingWindow, file->slice_bytes});
+        batch->charge = batch->staging_size *
+                        (file->transport_type == TRANSPORT_GDS ? 2 : 1);
+        batch->budget = staging_budget_;
+        for (uint64_t part = 0; part < total; part += batch->staging_size) {
             Request req;
             req.opcode = opcode == OPCODE_READ ? Request::READ : Request::WRITE;
-            req.source = reinterpret_cast<void*>(address + part);
-            req.length =
-                std::min(uint64_t{file->slice_bytes}, range.length - part);
-            // Bounds are checked before admission, including addition wrap.
-            if (offset > file->length || req.length > file->length - offset)
-                return TENT_FILE_INVALID_ARGUMENT;
-            req.target_offset = offset;
-            req.target_id = LOCAL_SEGMENT_ID;  // explicit sub-batch file owner
+            req.source = nullptr;  // worker-owned scratch, allocated once
+            req.length = std::min(uint64_t{batch->staging_size}, total - part);
+            req.target_offset = offset + part;
+            req.target_id = LOCAL_SEGMENT_ID;
             batch->requests.push_back(std::move(req));
-            offset += batch->requests.back().length;
         }
-        total += range.length;
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            const auto& range = elements[i];
+            const uintptr_t address =
+                reinterpret_cast<uintptr_t>(range.address);
+            for (uint64_t part = 0; part < range.length;
+                 part += file->slice_bytes) {
+                Request req;
+                req.opcode =
+                    opcode == OPCODE_READ ? Request::READ : Request::WRITE;
+                req.source = reinterpret_cast<void*>(address + part);
+                req.length =
+                    std::min(uint64_t{file->slice_bytes}, range.length - part);
+                req.target_offset = offset;
+                req.target_id =
+                    LOCAL_SEGMENT_ID;  // explicit sub-batch file owner
+                batch->requests.push_back(std::move(req));
+                offset += batch->requests.back().length;
+            }
+        }
     }
 #ifdef USE_CUDA
     if (file->transport_type == TRANSPORT_GDS) {
@@ -261,11 +417,16 @@ int FileIO::submit(tent_file_id_t file_id, int opcode, uint64_t offset,
     // a blocked driver must not prevent other batches from timing out/draining.
     std::lock_guard<std::mutex> lock(mutex_);
     if (file->closing || batches_.size() >= kMaxBatches) return TENT_FILE_BUSY;
+    if (batch->charge > kStagingBudget - staging_budget_->bytes.load())
+        return TENT_FILE_BUSY;
+    batch->platform = platform_;
     const auto batch_id = next_id_++;
     batches_.emplace(batch_id, batch);
+    staging_budget_->bytes.fetch_add(batch->charge);
     try {
         batch->worker = std::thread(run, batch);
     } catch (...) {
+        staging_budget_->bytes.fetch_sub(batch->charge);
         batches_.erase(batch_id);
         return TENT_FILE_BUSY;
     }
@@ -295,13 +456,33 @@ void FileIO::run(const std::shared_ptr<Batch>& batch) noexcept {
             outcome = TENT_FILE_IO_ERROR;
         }
 #endif
+        if (outcome == TENT_FILE_OK && batch->staging_size &&
+            !batch->allocateStaging()) {
+            if (batch->host_staging) {
+                batch->unknown();
+                return;
+            }
+            // Host allocation failed before any copy, registration or I/O.
+            outcome = TENT_FILE_IO_ERROR;
+        }
         for (size_t base = 0; base < batch->requests.size() &&
                               outcome == TENT_FILE_OK && !batch->stop.load();) {
             const size_t count =
-                std::min(file.depth, batch->requests.size() - base);
+                std::min(batch->staging_size ? size_t{1} : file.depth,
+                         batch->requests.size() - base);
             std::vector<Request> window(batch->requests.begin() + base,
                                         batch->requests.begin() + base + count);
             std::vector<TransferStatus> statuses(count, {PENDING, 0});
+            if (batch->staging_size) {
+                window[0].source = batch->io_staging;
+                if (window[0].opcode == Request::WRITE &&
+                    !batch->copyWindow(bytes, window[0].length, true)) {
+                    batch->unknown();
+                    return;
+                }
+                // Cancellation during a staging copy closes future dispatch.
+                if (batch->stop.load()) break;
+            }
             auto status = transport.allocateSubBatch(batch->native, count);
             if (!status.ok()) {
                 outcome = TENT_FILE_IO_ERROR;
@@ -337,6 +518,16 @@ void FileIO::run(const std::shared_ptr<Batch>& batch) noexcept {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             for (size_t i = 0; i < admitted; ++i) {
+                if (statuses[i].transferred_bytes > window[i].length) {
+                    batch->unknown();
+                    return;
+                }
+                if (batch->staging_size && window[i].opcode == Request::READ &&
+                    !batch->copyWindow(bytes, statuses[i].transferred_bytes,
+                                       false)) {
+                    batch->unknown();
+                    return;
+                }
                 bytes += statuses[i].transferred_bytes;
                 if (outcome == TENT_FILE_OK) {
                     if (statuses[i].s == CANCELED)
@@ -365,6 +556,10 @@ void FileIO::run(const std::shared_ptr<Batch>& batch) noexcept {
                 batch->result.transferred_bytes = bytes;
             }
         }
+        if (!batch->releaseDeviceStaging()) {
+            batch->unknown();
+            return;
+        }
 #ifdef USE_CUDA
         if (batch->cuda_context && cuCtxSetCurrent(nullptr) != CUDA_SUCCESS) {
             batch->unknown();
@@ -372,6 +567,11 @@ void FileIO::run(const std::shared_ptr<Batch>& batch) noexcept {
         }
 #endif
         if (outcome == TENT_FILE_OK) outcome = batch->stop.load();
+        free(batch->host_staging);
+        batch->host_staging = nullptr;
+        batch->io_staging = nullptr;
+        if (batch->budget) batch->budget->bytes.fetch_sub(batch->charge);
+        batch->charge = 0;
         batch->file.reset();
         batch->owner.release(batch->owner.context);
         std::lock_guard<std::mutex> lock(batch->mutex);

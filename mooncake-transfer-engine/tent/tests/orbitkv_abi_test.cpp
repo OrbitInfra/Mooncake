@@ -53,6 +53,10 @@ CHECK_ABI(tent_get_nic_load_stats,
 
 static_assert(std::is_same_v<decltype(&tent_terminal_result),
                              int (*)(void*, uint64_t, size_t, int*, int*)>);
+static_assert(std::is_same_v<decltype(&tent_file_submitv),
+                             int (*)(void*, uint64_t, int, uint64_t,
+                                     const tent_file_element_t*, size_t,
+                                     const tent_file_owner_t*, uint64_t*)>);
 
 TEST(OrbitKvAbi, SharedLibraryExportsEveryConsumedSymbol) {
     void* library = dlopen(TENT_SHARED_PATH, RTLD_NOW | RTLD_LOCAL);
@@ -72,7 +76,8 @@ TEST(OrbitKvAbi, SharedLibraryExportsEveryConsumedSymbol) {
           "tent_get_nic_load_stats", "tent_create_engine_with_files",
           "tent_file_open",          "tent_file_submit",
           "tent_file_drain",         "tent_file_release_batch",
-          "tent_file_close",         "tent_terminal_result"}) {
+          "tent_file_close",         "tent_terminal_result",
+          "tent_file_submitv"}) {
         EXPECT_NE(dlsym(library, name), nullptr) << name;
     }
     EXPECT_EQ(dlclose(library), 0);

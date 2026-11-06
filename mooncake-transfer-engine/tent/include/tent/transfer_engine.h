@@ -141,6 +141,18 @@ typedef struct tent_file_range {
     uint64_t length;
 } tent_file_range_t;
 
+/* Additive vector API; tent_file_range_t and tent_file_submit are unchanged. */
+typedef enum tent_file_element_kind {
+    TENT_FILE_ELEMENT_RANGE = 0,
+    TENT_FILE_ELEMENT_PADDING = 1
+} tent_file_element_kind_t;
+
+typedef struct tent_file_element {
+    tent_file_element_kind_t kind;
+    void* address;   /* RANGE: nonnull; PADDING: must be NULL */
+    uint64_t length; /* nonzero; padding counts toward the file extent */
+} tent_file_element_t;
+
 /* Both callbacks must be nonthrowing, nonblocking, and must not reenter this
  * file API. retain/release must own the actual backing, registrations and
  * extent. Producer readiness and exclusive READ destinations are caller
@@ -154,7 +166,8 @@ typedef struct tent_file_owner {
 typedef struct tent_file_result {
     tent_file_error_t outcome;
     uint32_t drained; /* 1 only after native I/O, staging and owner release */
-    uint64_t transferred_bytes; /* sum, not necessarily a contiguous prefix */
+    uint64_t transferred_bytes; /* submitv: prefix including padding;
+                                 * legacy aligned submit: sum over ranges */
 } tent_file_result_t;
 
 /* Applies the existing thread-local settings, then overrides file transport
@@ -169,6 +182,8 @@ int tent_file_open(tent_engine_t engine, const char* uri,
                    tent_file_id_t* file, uint64_t* length);
 
 /* Up to 16384 ranges / 64 MiB, mapped consecutively from file_offset.
+ * Unaligned vectors use the same bounded staging as submitv (without padding).
+ * Aligned vectors retain parallel windows and sum-of-ranges byte receipts.
  * READ/WRITE use OPCODE_READ/WRITE. No extension, replay, fsync or atomicity.
  * On success, retain has run and one batch owns the token until drained.
  * On rejection, no I/O or callback has run and *batch is zero. */
@@ -176,6 +191,23 @@ int tent_file_submit(tent_engine_t engine, tent_file_id_t file, int opcode,
                      uint64_t file_offset, const tent_file_range_t* ranges,
                      size_t count, const tent_file_owner_t* owner,
                      tent_file_batch_t* batch);
+
+/* Contiguous file extent, in element order. WRITE padding emits zeros; READ
+ * padding consumes/discards file bytes without touching caller memory. TENT
+ * owns bounded staging (4 MiB windows, 64 MiB charged per engine) through all
+ * I/O and copies. io_uring accepts odd addresses, lengths and file offsets;
+ * odd file extents use buffered io_uring on the same pinned inode, with no
+ * read/modify/write of neighboring bytes. GDS stages on the GPU; native-only
+ * still requires device RANGE elements and 4 KiB-aligned offset/total length.
+ * No silent transport fallback. The original retain/release and drain rules
+ * apply, including all-padding vectors. Limits: 16384 elements / 64 MiB.
+ * transferred_bytes is the completed file prefix, INCLUDING padding; a short
+ * READ scatters only that prefix. Copies/cleanup without a quiescence receipt
+ * retain backing, staging and its budget; never replay a WRITE. */
+int tent_file_submitv(tent_engine_t engine, tent_file_id_t file, int opcode,
+                      uint64_t file_offset, const tent_file_element_t* elements,
+                      size_t count, const tent_file_owner_t* owner,
+                      tent_file_batch_t* batch);
 
 /* cancel != 0 closes dispatch of subsequent windows; the current window may
  * finish. A timeout also closes dispatch. Neither is a physical receipt.

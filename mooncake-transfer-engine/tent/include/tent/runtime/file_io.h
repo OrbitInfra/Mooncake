@@ -10,6 +10,7 @@
 #include <mutex>
 
 #include "tent/runtime/transport.h"
+#include "tent/runtime/platform.h"
 #include "tent/transfer_engine.h"
 
 namespace mooncake::tent {
@@ -30,6 +31,9 @@ class FileIO {
     int submit(tent_file_id_t file, int opcode, uint64_t offset,
                const tent_file_range_t* ranges, size_t count,
                const tent_file_owner_t& owner, tent_file_batch_t& id);
+    int submitv(tent_file_id_t file, int opcode, uint64_t offset,
+                const tent_file_element_t* elements, size_t count,
+                const tent_file_owner_t& owner, tent_file_batch_t& id);
     int drain(tent_file_batch_t id, uint64_t timeout_ms, bool cancel,
               tent_file_result_t& result);
     int release(tent_file_batch_t id);
@@ -40,10 +44,19 @@ class FileIO {
     // injecting lost completion observations without simulating file I/O.
     std::shared_ptr<Transport> replaceUringForTest(
         std::shared_ptr<Transport> replacement);
+    // Per-engine GPU-copy shim; installed before opening any file. Real I/O
+    // still goes through the selected transport. Batches retain this platform.
+    void setPlatformForTest(std::shared_ptr<Platform> platform);
+    size_t stagingBytesForTest() const;
 
    private:
     struct File;
     struct Batch;
+    struct StagingBudget;
+    int submitElements(tent_file_id_t file, int opcode, uint64_t offset,
+                       const tent_file_element_t* elements, size_t count,
+                       const tent_file_owner_t& owner, tent_file_batch_t& id,
+                       bool stage);
     using Clock = std::chrono::steady_clock;
     static void run(const std::shared_ptr<Batch>& batch) noexcept;
     static int wait(const std::shared_ptr<Batch>& batch,
@@ -51,6 +64,8 @@ class FileIO {
                     tent_file_result_t& result);
     tent_file_options_t options_;
     std::shared_ptr<Transport> uring_, gds_;
+    std::shared_ptr<Platform> platform_;
+    std::shared_ptr<StagingBudget> staging_budget_;
     std::mutex mutex_;
     uint64_t next_id_{1};
     size_t opening_{0};

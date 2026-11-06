@@ -421,6 +421,10 @@ The header defines `tent_file_options_t` (struct size, io_uring enable, GDS mode
 and the two queue depths), `tent_file_range_t` (address and length),
 `tent_file_owner_t` (context, retain and release callbacks), and
 `tent_file_result_t` (outcome, drained flag and transferred bytes).
+`tent_file_submitv` adds typed elements for OrbitKV A2 (#316), so its file
+adapter can hand TENT padding and fragmented host/GPU ranges without a scratch
+buffer. Existing functions and layouts, including `tent_file_range_t`, are
+unchanged; this file API is fork-only.
 
 ```c
 int tent_create_engine_with_files(const tent_file_options_t* options,
@@ -432,6 +436,19 @@ int tent_file_submit(tent_engine_t engine, tent_file_id_t file, int opcode,
                      uint64_t file_offset, const tent_file_range_t* ranges,
                      size_t count, const tent_file_owner_t* owner,
                      tent_file_batch_t* batch);
+typedef enum tent_file_element_kind {
+    TENT_FILE_ELEMENT_RANGE = 0,
+    TENT_FILE_ELEMENT_PADDING = 1
+} tent_file_element_kind_t;
+typedef struct tent_file_element {
+    tent_file_element_kind_t kind;
+    void* address;
+    uint64_t length;
+} tent_file_element_t;
+int tent_file_submitv(tent_engine_t engine, tent_file_id_t file, int opcode,
+                      uint64_t file_offset,
+                      const tent_file_element_t* elements, size_t count,
+                      const tent_file_owner_t* owner, tent_file_batch_t* batch);
 int tent_file_drain(tent_engine_t engine, tent_file_batch_t batch,
                     uint64_t timeout_ms, int cancel,
                     tent_file_result_t* result);
@@ -461,13 +478,30 @@ ID. Files must already have their allocated length; submission rejects an
 out-of-bounds range or integer overflow before retaining a token or dispatching.
 A subsequent external truncation can still produce a short-read receipt.
 
-A vector maps its local ranges consecutively from `file_offset`. TENT expresses
-this as multiple physical requests, not one atomic vectored syscall. Requests
-are split at no more than 16 MiB and dispatched in windows of at most the selected queue
-depth. Completion bytes are the sum over ranges, **not a contiguous prefix**
-when a parallel window partially fails. A short READ copies back only bytes
-actually read and leaves the unread suffix unchanged. No partial WRITE is
-replayed, and no failed window is sent to another backend.
+A vector maps its elements consecutively from `file_offset`. A RANGE element
+has a nonnull address and a nonzero length. A PADDING element has a **null**
+address and a nonzero length: WRITE emits zeros; READ consumes and discards
+file bytes without touching caller memory. Padding counts toward bounds,
+admission limits and the completed file prefix. An all-padding vector still
+requires an owner token, retaining the caller's extent reservation.
+
+`tent_file_submitv` gathers/scatters through TENT-owned scratch in windows of at
+most 4 MiB, submitting one contiguous request at a time. Its receipt is the
+**completed file prefix including padding**. A short READ scatters only that
+prefix, even when EOF falls inside padding; later ranges stay unchanged.
+Unaligned vectors passed to the original `tent_file_submit` also use staging.
+Aligned legacy vectors retain their parallel windows: requests are split at
+16 MiB and dispatched up to the selected queue depth, with sum-of-ranges
+receipts that need not be a contiguous prefix. Neither API is atomic; a
+partial WRITE is never replayed or sent to another backend.
+
+IOURING accepts odd host/GPU addresses, lengths and file offsets. The explicit
+file owner opens both direct and buffered descriptors on the pinned inode.
+Before dispatch it selects buffered io_uring for an extent whose offset or
+length is not 4 KiB aligned, and direct I/O otherwise (buffered when the
+filesystem rejects opening O_DIRECT). It never rounds a WRITE outward or
+performs read/modify/write on neighboring bytes. The generic upstream file
+context is unchanged; this is a fork file-API capability extension.
 
 Admission is bounded per engine: 256 open/opening/retained files, 32 live batch
 receipts, 16384 input ranges and 64 MiB per batch. Active and uncertain batches
@@ -475,6 +509,13 @@ continue consuming their slot and byte allowance; even a completed receipt
 occupies its slot until `tent_file_release_batch`. There is one worker per
 admitted batch and at most one cleanup worker per closing file. File handles
 use explicit native owners, not the unbounded legacy file-descriptor caches.
+Vector staging additionally reserves a shared **64 MiB per-engine budget**
+before admission; exhausted budget returns `TENT_FILE_BUSY` with no callback
+or I/O. IOURING charges its host window; GDS charges both its host zero-fill
+window and GPU window (at most 8 MiB combined). Charges survive timeout,
+uncertain copies and failed cleanup. They return only after physical I/O and
+copies finish and scratch cleanup succeeds. A completed receipt keeps its
+batch slot but no scratch charge.
 
 ### Ownership, cancellation and physical drain
 
@@ -485,8 +526,10 @@ physical drain, and establishes GPU producer readiness before submission.
 Callbacks must be nonthrowing and nonblocking, must not reenter the file API,
 and support
 execution on a worker thread; release cannot assume a caller CUDA context.
-Native registration cleanup remains the caller's responsibility and a failed
-unregister must retain its owner. The callback releases TENT's reference, not a
+Cleanup of caller registrations remains the caller's responsibility and a
+failed unregister must retain its owner. TENT separately owns and deregisters
+its GPU staging; a failed deregister retains that window and its charge. The
+callback releases TENT's reference, not a
 promise that the caller's other references or registrations have been freed.
 
 A successful submit calls retain exactly once before dispatch. Rejection
@@ -538,8 +581,13 @@ IOURING supports host buffers and TENT's CUDA-through-host-staging path. GDS ON
 uses cuFile's configured routing, which may include compatibility I/O. GDS
 NATIVE_ONLY fails closed unless live cuFile queries prove both
 `allow_compat_mode` and `force_compat_mode` disabled, and batch I/O is available.
-It currently accepts only local ext4/XFS files and 4 KiB-aligned NVIDIA device
-addresses, lengths and offsets; managed and host memory are rejected. Native-only slices are also capped by the live
+It currently accepts only local ext4/XFS files and NVIDIA device RANGE
+elements; managed and host memory are rejected. Fragmented/unaligned device
+ranges and padding are gathered/scattered through a registered, aligned GPU
+window. Native-only still requires a 4 KiB-aligned file offset and total
+extent length. GDS ON permits cuFile's configured compatibility routing for
+odd extents; neither mode silently falls back to IOURING. Native-only windows
+are also capped by the live
 cuFile bounce-cache and direct-I/O limits, because an oversized batch slice can
 otherwise take compatibility I/O. Interior ranges of memory registered with
 this engine preserve cuFile's registered base plus buffer offset. Make GDS
@@ -556,9 +604,11 @@ This API covers OrbitKV's preallocated shard files, retained exact inode,
 scatter/gather byte movement, read/write permissions, deadline/cancel and
 physical-drain receipts. It does not create/extend shards, allocate extents,
 encode records, publish indexes, provide fsync durability, make a vector atomic,
-or do OrbitKV's GPU gather/scatter kernels. Those remain consumer work. A
-separate OrbitKV change must add the new FFI/types, retain/release token bridge,
-file-engine configuration and receipt mapping; every non-drained result maps
+or run record codecs. Those remain consumer work. OrbitKV can replace its
+TENT-only scratch adapter with `tent_file_submitv`: map data to RANGE, gaps and
+tails to PADDING, and retain the backing/extent token through drain. No caller
+scratch, zero fill, gather/scatter or padding copy is required. Add the new
+element type and symbol to its FFI separately; every non-drained result maps
 to `Unquiesced`, and WRITE publication requires a full-byte drained success.
 
 ### File API validation
@@ -570,8 +620,34 @@ It covers byte-checked vector round trips, permission/overflow rejection,
 short reads and EOF with unchanged suffixes, cancel and deadline drain,
 retained actual backing after a lost completion, capacity retention, inode
 replacement, delayed file close, and non-retried failed cleanup.
+The padding/vector additions cover nonzero-file gap/tail zeroing, READ
+discard, odd legacy ranges and file offsets, a short READ inside padding,
+cross-window vectors, cancel during a GPU-copy shim, lost completion and
+failed cleanup retaining scratch, and shared-budget exhaustion/recovery.
+The GPU shim drives the production FileIO owner and real io_uring bytes; it
+does not claim a physical GPU copy or native GDS route.
 
-Final local results on the same Debian trixie aarch64 image, Linux
+Padding/vector validation on the Linux container described below, with
+`--security-opt seccomp=unconfined`: 22/22 CPU CTest entries passed (523 case
+invocations: 520 passed, three RDMA availability/hardware skips). The expanded
+file suite passed **26 cases × 50 repetitions on each filesystem**, 2600 total
+invocations with no failures or skips. The full TCP stress passed **13 cases ×
+200 repetitions**, 2600 invocations with no failures. After the CPU build,
+these were the repeated commands inside the container:
+
+```bash
+.git/validation/build-linux/tent/tests/tent_orbitkv_file_io_test --gtest_repeat=50
+TENT_FILE_TEST_DIR=/tmp .git/validation/build-linux/tent/tests/tent_orbitkv_file_io_test --gtest_repeat=50
+.git/validation/build-linux/tent/tests/tent_tcp_regression_test --gtest_repeat=200
+```
+
+The padding extension's logs and counts are under
+`.git/validation/file-padding/` (outside Git). The hosted workflow runs the
+same 26 file cases on both filesystems in its CPU leg, and compiles the new
+API with CUDA/cuFile in its CUDA leg. Actual GPU copies and GDS routes remain
+unverified without hardware.
+
+Initial file-API results (before the padding extension) on Debian trixie aarch64, Linux
 6.12.76-linuxkit, GCC 14.4.0, and CMake 3.31.6:
 
 | Gate | Result |

@@ -124,6 +124,21 @@ int tent_file_submit(tent_engine_t engine, tent_file_id_t file, int opcode,
     }
 }
 
+int tent_file_submitv(tent_engine_t engine, tent_file_id_t file, int opcode,
+                      uint64_t file_offset, const tent_file_element_t* elements,
+                      size_t count, const tent_file_owner_t* owner,
+                      tent_file_batch_t* batch) {
+    if (batch) *batch = 0;
+    if (!engine || !batch || !owner) return TENT_FILE_INVALID_ARGUMENT;
+    if (!CAST(engine)->fileIO()) return TENT_FILE_DISABLED;
+    try {
+        return CAST(engine)->fileIO()->submitv(file, opcode, file_offset,
+                                               elements, count, *owner, *batch);
+    } catch (...) {
+        return TENT_FILE_IO_ERROR;
+    }
+}
+
 int tent_file_drain(tent_engine_t engine, tent_file_batch_t batch,
                     uint64_t timeout_ms, int cancel,
                     tent_file_result_t* result) {

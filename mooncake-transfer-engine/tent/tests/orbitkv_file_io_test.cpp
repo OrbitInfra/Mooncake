@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "tent/runtime/file_io.h"
+#include "tent/platform/cpu.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transfer_engine.h"
 
@@ -24,6 +25,9 @@ using namespace std::chrono_literals;
 extern "C" int file_c_api_read(tent_engine_t, tent_file_id_t,
                                tent_file_range_t*, size_t,
                                const tent_file_owner_t*, tent_file_result_t*);
+extern "C" int file_c_api_vector(tent_engine_t, tent_file_id_t, int, uint64_t,
+                                 const tent_file_element_t*, size_t,
+                                 const tent_file_owner_t*, tent_file_result_t*);
 
 namespace {
 struct Counts {
@@ -58,6 +62,34 @@ struct Backing {
 };
 using Buffer = std::unique_ptr<Backing, decltype(&Backing::drop)>;
 Buffer buffer(size_t size) { return Buffer(new Backing(size), Backing::drop); }
+
+// CPU shim at the production Platform::copy boundary. Only the device copy
+// is simulated: submission, scratch ownership and file bytes are real.
+class DeviceCopyShim : public CpuPlatform {
+   public:
+    uintptr_t begin;
+    size_t length;
+    std::atomic<int> gathers{0}, scatters{0};
+    std::atomic<bool> fail{false}, hold{false}, entered{false};
+    DeviceCopyShim(void* address, size_t size)
+        : CpuPlatform(std::make_shared<Config>()),
+          begin(reinterpret_cast<uintptr_t>(address)),
+          length(size) {}
+    MemoryType getMemoryType(void* p) override {
+        auto address = reinterpret_cast<uintptr_t>(p);
+        return address >= begin && address - begin < length ? MTYPE_CUDA
+                                                            : MTYPE_CPU;
+    }
+    Status copy(void* dst, void* src, size_t size) override {
+        if (getMemoryType(src) == MTYPE_CUDA) ++gathers;
+        if (getMemoryType(dst) == MTYPE_CUDA) ++scatters;
+        entered = true;
+        while (hold) std::this_thread::sleep_for(1ms);
+        if (fail) return Status::InternalError("injected uncertain copy");
+        memcpy(dst, src, size);
+        return Status::OK();
+    }
+};
 
 // All I/O goes through the installed io_uring transport. Only completion
 // observation or the cleanup return is injected; no fake byte movement.
@@ -213,6 +245,31 @@ class FileCApi : public testing::Test {
             std::this_thread::sleep_for(1ms);
         } while (std::chrono::steady_clock::now() < end);
         return result;
+    }
+    FileIO* fileIO() {
+        return static_cast<TransferEngineImpl*>(engine)->fileIO();
+    }
+    tent_file_batch_t submitv(tent_file_id_t f, int opcode, uint64_t offset,
+                              const std::vector<tent_file_element_t>& elements,
+                              Backing& backing) {
+        tent_file_batch_t b = 0;
+        auto owner = backing.token();
+        EXPECT_EQ(tent_file_submitv(engine, f, opcode, offset, elements.data(),
+                                    elements.size(), &owner, &b),
+                  TENT_FILE_OK);
+        if (b) batches.push_back(b);
+        return b;
+    }
+    tent_file_id_t largeFile(size_t length) {
+        EXPECT_EQ(ftruncate(fd, length), 0);
+        tent_file_id_t f = 0;
+        uint64_t actual = 0;
+        EXPECT_EQ(tent_file_open(engine, uri.c_str(), TENT_FILE_READ_WRITE,
+                                 TRANSPORT_IOURING, &f, &actual),
+                  TENT_FILE_OK);
+        EXPECT_EQ(actual, length);
+        if (f) files.push_back(f);
+        return f;
     }
     void awaitPoll() {
         const auto end = std::chrono::steady_clock::now() + 5s;
@@ -524,6 +581,362 @@ TEST_F(FileCApi, FileCleanupFailureDoesNotRetryNativeDestroy) {
             }
             tent_destroy_engine(engine);
             if (fault->closes != 1 || fault->opened.expired()) _exit(2);
+            _exit(0);
+        },
+        testing::ExitedWithCode(0), "");
+}
+TEST_F(FileCApi, PaddingWritesZerosAndReadsDiscardThroughCTranslationUnit) {
+    auto f = open();
+    auto b = buffer(4096);
+    auto* data = static_cast<unsigned char*>(b->bytes);
+    std::vector<unsigned char> disk(4096, 0xa5);
+    ASSERT_EQ(pwrite(fd, disk.data(), disk.size(), 0), 4096);
+    memset(data + 1, 0x31, 3);
+    memset(data + 19, 0x72, 7);
+    const tent_file_element_t elements[] = {
+        {TENT_FILE_ELEMENT_RANGE, data + 1, 3},
+        {TENT_FILE_ELEMENT_PADDING, nullptr, 5},
+        {TENT_FILE_ELEMENT_RANGE, data + 19, 7},
+        {TENT_FILE_ELEMENT_PADDING, nullptr, 11}};
+    auto owner = b->token();
+    tent_file_result_t result{};
+    ASSERT_EQ(file_c_api_vector(engine, f, OPCODE_WRITE, 13, elements, 4,
+                                &owner, &result),
+              TENT_FILE_OK);
+    EXPECT_EQ(result.drained, 1u);
+    EXPECT_EQ(result.transferred_bytes, 26u);
+    ASSERT_EQ(pread(fd, disk.data(), disk.size(), 0), 4096);
+    for (size_t i = 0; i < disk.size(); ++i) {
+        unsigned char expected = 0xa5;
+        if (i >= 13 && i < 39) expected = 0;
+        if (i >= 13 && i < 16) expected = 0x31;
+        if (i >= 21 && i < 28) expected = 0x72;
+        ASSERT_EQ(disk[i], expected) << i;
+    }
+    // Padding consumes nonzero file data but has no caller destination.
+    memset(disk.data() + 16, 0xe3, 5);
+    memset(disk.data() + 28, 0xe4, 11);
+    ASSERT_EQ(pwrite(fd, disk.data(), disk.size(), 0), 4096);
+    memset(data, 0xcc, 4096);
+    ASSERT_EQ(file_c_api_vector(engine, f, OPCODE_READ, 13, elements, 4, &owner,
+                                &result),
+              TENT_FILE_OK);
+    EXPECT_EQ(result.transferred_bytes, 26u);
+    for (size_t i = 0; i < 4096; ++i) {
+        unsigned char expected = 0xcc;
+        if (i >= 1 && i < 4) expected = 0x31;
+        if (i >= 19 && i < 26) expected = 0x72;
+        ASSERT_EQ(data[i], expected) << i;
+    }
+    EXPECT_EQ(fault->submits, 2);
+    EXPECT_EQ(fileIO()->stagingBytesForTest(), 0u);
+}
+
+TEST_F(FileCApi, LegacyUnalignedVectorsUseOwnedStaging) {
+    auto f = open();
+    auto b = buffer(4096);
+    auto* data = static_cast<unsigned char*>(b->bytes);
+    memset(data + 1, 0x37, 7);
+    memset(data + 23, 0x61, 17);
+    const std::vector<tent_file_range_t> ranges{{data + 1, 7}, {data + 23, 17}};
+    auto write = submit(f, OPCODE_WRITE, 19, ranges, *b);
+    auto result = finish(write);
+    ASSERT_EQ(result.outcome, TENT_FILE_OK);
+    ASSERT_EQ(result.transferred_bytes, 24u);
+    memset(data, 0xa9, 4096);
+    auto read = submit(f, OPCODE_READ, 19, ranges, *b);
+    result = finish(read);
+    ASSERT_EQ(result.outcome, TENT_FILE_OK);
+    ASSERT_EQ(result.transferred_bytes, 24u);
+    for (size_t i = 0; i < 4096; ++i) {
+        unsigned char expected = 0xa9;
+        if (i >= 1 && i < 8) expected = 0x37;
+        if (i >= 23 && i < 40) expected = 0x61;
+        ASSERT_EQ(data[i], expected) << i;
+    }
+    EXPECT_EQ(fault->submits, 2);
+}
+
+TEST_F(FileCApi, ShortReadInsidePaddingReportsFilePrefixAndLeavesTail) {
+    auto f = open();
+    auto b = buffer(4096);
+    auto* data = static_cast<unsigned char*>(b->bytes);
+    const unsigned char disk[]{1, 2, 3, 4, 5, 6, 7};
+    ASSERT_EQ(pwrite(fd, disk, sizeof(disk), 3), 7);
+    ASSERT_EQ(ftruncate(fd, 10), 0);  // descriptor retains its admitted extent
+    auto read = submitv(f, OPCODE_READ, 3,
+                        {{TENT_FILE_ELEMENT_RANGE, data + 1, 3},
+                         {TENT_FILE_ELEMENT_PADDING, nullptr, 10},
+                         {TENT_FILE_ELEMENT_RANGE, data + 31, 5}},
+                        *b);
+    auto result = finish(read);
+    ASSERT_EQ(result.drained, 1u);
+    EXPECT_EQ(result.outcome, TENT_FILE_SHORT_IO);
+    EXPECT_EQ(result.transferred_bytes, 7u);  // 3 data + 4 discarded padding
+    for (size_t i = 0; i < 4096; ++i)
+        ASSERT_EQ(data[i], i >= 1 && i < 4 ? i : 0x7a) << i;
+    EXPECT_EQ(fault->submits, 1);
+    EXPECT_EQ(fileIO()->stagingBytesForTest(), 0u);
+}
+
+TEST_F(FileCApi, PaddingAndRangesCrossStagingWindows) {
+    constexpr size_t window = 4 << 20;
+    auto f = largeFile(window + 8192);
+    auto b = buffer(8192);
+    auto* data = static_cast<unsigned char*>(b->bytes);
+    memset(data + 1, 0x31, 7);
+    memset(data + 31, 0x62, 73);
+    const std::vector<tent_file_element_t> elements{
+        {TENT_FILE_ELEMENT_RANGE, data + 1, 7},
+        {TENT_FILE_ELEMENT_PADDING, nullptr, window + 5},
+        {TENT_FILE_ELEMENT_RANGE, data + 31, 73},
+        {TENT_FILE_ELEMENT_PADDING, nullptr, 11}};
+    auto write = submitv(f, OPCODE_WRITE, 1, elements, *b);
+    auto result = finish(write);
+    ASSERT_EQ(result.outcome, TENT_FILE_OK);
+    EXPECT_EQ(result.transferred_bytes, window + 96u);
+    std::vector<unsigned char> disk(window + 97);
+    ASSERT_EQ(pread(fd, disk.data(), disk.size(), 0), disk.size());
+    for (size_t i = 0; i < disk.size(); ++i) {
+        unsigned char expected = 0;
+        if (i >= 1 && i < 8) expected = 0x31;
+        if (i >= window + 13 && i < window + 86) expected = 0x62;
+        ASSERT_EQ(disk[i], expected) << i;
+    }
+    memset(data, 0xab, 8192);
+    auto read = submitv(f, OPCODE_READ, 1, elements, *b);
+    result = finish(read);
+    ASSERT_EQ(result.outcome, TENT_FILE_OK);
+    EXPECT_EQ(result.transferred_bytes, window + 96u);
+    for (size_t i = 0; i < 8192; ++i) {
+        unsigned char expected = 0xab;
+        if (i >= 1 && i < 8) expected = 0x31;
+        if (i >= 31 && i < 104) expected = 0x62;
+        ASSERT_EQ(data[i], expected) << i;
+    }
+    EXPECT_EQ(fault->submits, 4);
+}
+
+TEST_F(FileCApi, StagedCancelRetainsScratchAndStopsNextWindow) {
+    constexpr size_t window = 4 << 20;
+    auto f = largeFile(window + 4096);
+    auto b = buffer(1);
+    fault->hold = true;
+    auto id = submitv(f, OPCODE_WRITE, 0,
+                      {{TENT_FILE_ELEMENT_PADDING, nullptr, window + 1}}, *b);
+    awaitPoll();
+    tent_file_result_t result{};
+    EXPECT_EQ(tent_file_drain(engine, id, 0, 1, &result), TENT_FILE_UNQUIESCED);
+    EXPECT_EQ(result.drained, 0u);
+    EXPECT_EQ(fileIO()->stagingBytesForTest(), window);
+    EXPECT_EQ(b->counts->released, 0);
+    fault->hold = false;
+    result = finish(id);
+    ASSERT_EQ(result.drained, 1u);
+    EXPECT_EQ(result.outcome, TENT_FILE_CANCELED);
+    EXPECT_EQ(result.transferred_bytes, window);
+    EXPECT_EQ(fault->submits, 1);
+    EXPECT_EQ(fileIO()->stagingBytesForTest(), 0u);
+}
+
+TEST_F(FileCApi, StagedLostCompletionRetainsOwnersAndBudgetWithoutReplay) {
+    auto f = open();
+    auto b = buffer(4096);
+    auto counts = b->counts;
+    fault->fail_poll = true;
+    auto id = submitv(f, OPCODE_WRITE, 5,
+                      {{TENT_FILE_ELEMENT_RANGE, b->bytes, 13},
+                       {TENT_FILE_ELEMENT_PADDING, nullptr, 7}},
+                      *b);
+    b.reset();
+    awaitPoll();
+    tent_file_result_t result{};
+    EXPECT_EQ(tent_file_drain(engine, id, 5000, 1, &result),
+              TENT_FILE_UNQUIESCED);
+    EXPECT_EQ(result.drained, 0u);
+    EXPECT_EQ(result.outcome, TENT_FILE_IO_ERROR);
+    EXPECT_EQ(tent_file_release_batch(engine, id), TENT_FILE_UNQUIESCED);
+    EXPECT_EQ(tent_file_close(engine, f, 0, &result), TENT_FILE_UNQUIESCED);
+    EXPECT_EQ(counts->destroyed, 0);
+    EXPECT_EQ(fileIO()->stagingBytesForTest(), 20u);
+    fault->fail_poll = false;
+    result = finish(id);
+    EXPECT_EQ(result.drained, 1u);
+    EXPECT_EQ(result.outcome, TENT_FILE_IO_ERROR);
+    EXPECT_EQ(result.transferred_bytes, 20u);
+    EXPECT_EQ(counts->destroyed, 1);
+    EXPECT_EQ(fileIO()->stagingBytesForTest(), 0u);
+    EXPECT_EQ(fault->submits, 1);
+}
+
+TEST_F(FileCApi, PaddingBudgetIsBoundedAndReleasedOnlyAfterDrain) {
+    constexpr size_t window = 4 << 20;
+    auto f = largeFile(window);
+    auto b = buffer(1);
+    fault->hold = true;
+    for (int i = 0; i < 16; ++i)
+        submitv(f, OPCODE_READ, 0,
+                {{TENT_FILE_ELEMENT_PADDING, nullptr, window}}, *b);
+    EXPECT_EQ(fileIO()->stagingBytesForTest(), 64u << 20);
+    const tent_file_element_t element{TENT_FILE_ELEMENT_PADDING, nullptr, 1};
+    auto owner = b->token();
+    tent_file_batch_t rejected = 99;
+    EXPECT_EQ(tent_file_submitv(engine, f, OPCODE_READ, 0, &element, 1, &owner,
+                                &rejected),
+              TENT_FILE_BUSY);
+    EXPECT_EQ(rejected, 0u);
+    EXPECT_EQ(b->counts->retained, 16);
+    EXPECT_EQ(b->counts->released, 0);
+    fault->hold = false;
+    for (auto id : batches) EXPECT_EQ(finish(id).drained, 1u);
+    EXPECT_EQ(fileIO()->stagingBytesForTest(), 0u);
+    auto id = submitv(f, OPCODE_READ, 0, {element}, *b);
+    EXPECT_EQ(finish(id).outcome, TENT_FILE_OK);
+}
+
+TEST_F(FileCApi, InvalidPaddingRejectsBeforeAdmission) {
+    auto f = open();
+    auto b = buffer(4096);
+    auto owner = b->token();
+    for (const auto& element : std::vector<tent_file_element_t>{
+             {static_cast<tent_file_element_kind_t>(99), nullptr, 1},
+             {TENT_FILE_ELEMENT_PADDING, b->bytes, 1},
+             {TENT_FILE_ELEMENT_PADDING, nullptr, 0},
+             {TENT_FILE_ELEMENT_PADDING, nullptr, UINT64_MAX},
+             {TENT_FILE_ELEMENT_RANGE, nullptr, 1}}) {
+        tent_file_batch_t id = 99;
+        EXPECT_EQ(tent_file_submitv(engine, f, OPCODE_WRITE, 0, &element, 1,
+                                    &owner, &id),
+                  TENT_FILE_INVALID_ARGUMENT);
+        EXPECT_EQ(id, 0u);
+    }
+    EXPECT_EQ(b->counts->retained, 0);
+    EXPECT_EQ(fault->submits, 0);
+    EXPECT_EQ(fileIO()->stagingBytesForTest(), 0u);
+}
+
+TEST_F(FileCApi, UnalignedGpuShimVectorsUseRealFileAndOwnedScratch) {
+    auto b = buffer(4096);
+    auto* data = static_cast<unsigned char*>(b->bytes);
+    auto shim = std::make_shared<DeviceCopyShim>(data, 4096);
+    fileIO()->setPlatformForTest(shim);
+    auto f = open();
+    memset(data + 1, 0x21, 17);
+    memset(data + 29, 0x42, 23);
+    const std::vector<tent_file_element_t> elements{
+        {TENT_FILE_ELEMENT_PADDING, nullptr, 3},
+        {TENT_FILE_ELEMENT_RANGE, data + 1, 17},
+        {TENT_FILE_ELEMENT_PADDING, nullptr, 7},
+        {TENT_FILE_ELEMENT_RANGE, data + 29, 23},
+        {TENT_FILE_ELEMENT_PADDING, nullptr, 9}};
+    auto write = submitv(f, OPCODE_WRITE, 5, elements, *b);
+    ASSERT_EQ(finish(write).outcome, TENT_FILE_OK);
+    std::vector<unsigned char> disk(59);
+    ASSERT_EQ(pread(fd, disk.data(), disk.size(), 5), disk.size());
+    for (size_t i = 0; i < disk.size(); ++i) {
+        unsigned char expected = 0;
+        if (i >= 3 && i < 20) expected = 0x21;
+        if (i >= 27 && i < 50) expected = 0x42;
+        ASSERT_EQ(disk[i], expected) << i;
+    }
+    memset(data, 0xcd, 4096);
+    auto read = submitv(f, OPCODE_READ, 5, elements, *b);
+    auto result = finish(read);
+    ASSERT_EQ(result.outcome, TENT_FILE_OK);
+    EXPECT_EQ(result.transferred_bytes, 59u);
+    for (size_t i = 0; i < 4096; ++i) {
+        unsigned char expected = 0xcd;
+        if (i >= 1 && i < 18) expected = 0x21;
+        if (i >= 29 && i < 52) expected = 0x42;
+        ASSERT_EQ(data[i], expected) << i;
+    }
+    EXPECT_EQ(shim->gathers, 2);
+    EXPECT_EQ(shim->scatters, 2);
+    EXPECT_EQ(fault->submits, 2);
+    EXPECT_EQ(fileIO()->stagingBytesForTest(), 0u);
+}
+
+TEST_F(FileCApi, StagedCleanupFailureRetainsScratchAndIsNeverRetried) {
+    ASSERT_EXIT(
+        {
+            auto f = open();
+            auto b = buffer(4096);
+            fault->fail_free = true;
+            auto id = submitv(f, OPCODE_WRITE, 3,
+                              {{TENT_FILE_ELEMENT_RANGE, b->bytes, 19},
+                               {TENT_FILE_ELEMENT_PADDING, nullptr, 7}},
+                              *b);
+            tent_file_result_t result{};
+            if (tent_file_drain(engine, id, 5000, 0, &result) !=
+                    TENT_FILE_UNQUIESCED ||
+                result.drained)
+                _exit(1);
+            for (int i = 0; i < 3; ++i)
+                if (tent_file_drain(engine, id, 0, 1, &result) !=
+                        TENT_FILE_UNQUIESCED ||
+                    result.drained)
+                    _exit(2);
+            if (fileIO()->stagingBytesForTest() != 26 ||
+                b->counts->released != 0 || fault->frees != 1 ||
+                fault->submits != 1)
+                _exit(3);
+            _exit(0);
+        },
+        testing::ExitedWithCode(0), "");
+}
+
+TEST_F(FileCApi, CancelDuringGpuShimGatherWaitsForCopyAndDoesNotDispatch) {
+    auto b = buffer(4096);
+    auto shim = std::make_shared<DeviceCopyShim>(b->bytes, 4096);
+    shim->hold = true;
+    fileIO()->setPlatformForTest(shim);
+    auto f = open();
+    auto id = submitv(f, OPCODE_WRITE, 1,
+                      {{TENT_FILE_ELEMENT_RANGE, b->bytes, 19},
+                       {TENT_FILE_ELEMENT_PADDING, nullptr, 7}},
+                      *b);
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!shim->entered && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(1ms);
+    EXPECT_TRUE(shim->entered);
+    tent_file_result_t result{};
+    EXPECT_EQ(tent_file_drain(engine, id, 0, 1, &result), TENT_FILE_UNQUIESCED);
+    EXPECT_EQ(result.drained, 0u);
+    EXPECT_EQ(b->counts->released, 0);
+    EXPECT_EQ(fileIO()->stagingBytesForTest(), 26u);
+    EXPECT_EQ(fault->submits, 0);
+    shim->hold = false;
+    result = finish(id);
+    EXPECT_EQ(result.drained, 1u);
+    EXPECT_EQ(result.outcome, TENT_FILE_CANCELED);
+    EXPECT_EQ(result.transferred_bytes, 0u);
+    EXPECT_EQ(b->counts->released, 1);
+    EXPECT_EQ(fileIO()->stagingBytesForTest(), 0u);
+    EXPECT_EQ(fault->submits, 0);
+}
+
+TEST_F(FileCApi, FailedGpuShimCopyRetainsBackingScratchAndCharge) {
+    ASSERT_EXIT(
+        {
+            auto b = buffer(4096);
+            auto shim = std::make_shared<DeviceCopyShim>(b->bytes, 4096);
+            shim->fail = true;
+            fileIO()->setPlatformForTest(shim);
+            auto f = open();
+            auto id = submitv(f, OPCODE_WRITE, 1,
+                              {{TENT_FILE_ELEMENT_RANGE, b->bytes, 19},
+                               {TENT_FILE_ELEMENT_PADDING, nullptr, 7}},
+                              *b);
+            tent_file_result_t result{};
+            if (tent_file_drain(engine, id, 5000, 0, &result) !=
+                    TENT_FILE_UNQUIESCED ||
+                result.drained)
+                _exit(1);
+            if (tent_file_release_batch(engine, id) != TENT_FILE_UNQUIESCED ||
+                fileIO()->stagingBytesForTest() != 26 ||
+                b->counts->released != 0 || fault->submits != 0 ||
+                shim->gathers != 1)
+                _exit(2);
             _exit(0);
         },
         testing::ExitedWithCode(0), "");

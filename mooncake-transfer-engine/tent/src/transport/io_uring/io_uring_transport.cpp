@@ -34,10 +34,18 @@ namespace mooncake {
 namespace tent {
 class IOUringFileContext : public Transport::File {
    public:
-    explicit IOUringFileContext(const std::string& path, int access = O_RDWR)
+    explicit IOUringFileContext(const std::string& path, int access = O_RDWR,
+                                bool allow_unaligned = false)
         : ready_(false) {
         fd_ = open(path.c_str(), access | O_DIRECT | O_CLOEXEC);
         if (fd_ >= 0) {
+            // Explicit C file handles keep both descriptors on the pinned
+            // inode. Choose before dispatch; never retry a failed WRITE or
+            // round it outward into neighboring bytes.
+            if (allow_unaligned) {
+                buffered_fd_ = open(path.c_str(), access | O_CLOEXEC);
+                if (buffered_fd_ < 0) return;
+            }
             ready_ = true;
             return;
         }
@@ -57,14 +65,20 @@ class IOUringFileContext : public Transport::File {
 
     ~IOUringFileContext() {
         if (fd_ >= 0) close(fd_);
+        if (buffered_fd_ >= 0) close(buffered_fd_);
     }
 
-    int getHandle() const { return fd_; }
+    int getHandle(uint64_t offset, uint64_t length) const {
+        return buffered_fd_ >= 0 && (offset % 4096 || length % 4096)
+                   ? buffered_fd_
+                   : fd_;
+    }
 
     bool ready() const { return ready_; }
 
    private:
     int fd_;
+    int buffered_fd_{-1};
     bool ready_;
 };
 
@@ -187,7 +201,7 @@ Status IOUringTransport::openFile(int fd, FileRef& file) {
     const int flags = fcntl(fd, F_GETFL);
     if (flags < 0) return Status::InvalidArgument("Invalid file descriptor");
     auto context = std::make_shared<IOUringFileContext>(
-        "/proc/self/fd/" + std::to_string(fd), flags & O_ACCMODE);
+        "/proc/self/fd/" + std::to_string(fd), flags & O_ACCMODE, true);
     if (!context->ready()) return Status::InternalError("Cannot open file");
     file = std::move(context);
     return Status::OK();
@@ -450,12 +464,12 @@ Status IOUringTransport::submitTransferTasks(
         struct io_uring_sqe* sqe = io_uring_get_sqe(&io_uring_batch->ring);
         CHECK(sqe) << "SQE space was verified before preparation";
 
+        const int fd =
+            contexts[i]->getHandle(request.target_offset, request.length);
         if (request.opcode == Request::READ) {
-            io_uring_prep_readv(sqe, contexts[i]->getHandle(), &task.iov, 1,
-                                request.target_offset);
+            io_uring_prep_readv(sqe, fd, &task.iov, 1, request.target_offset);
         } else {
-            io_uring_prep_writev(sqe, contexts[i]->getHandle(), &task.iov, 1,
-                                 request.target_offset);
+            io_uring_prep_writev(sqe, fd, &task.iov, 1, request.target_offset);
         }
         sqe->user_data = (uintptr_t)&task;
     }
