@@ -56,7 +56,7 @@ else
            tent_transport_selector_test request_merge_test
            tent_runtime_queue_dispatch_test tent_engine_failover_e2e_test
            tent_progress_worker_test)
-  pattern='^(segment_manager_test|request_merge_test|tent_(orbitkv_abi|orbitkv_file_io|orbitkv_c_status|tcp_transport|tcp_regression|tcp_datapath_roundtrip|local_memory_lifecycle|endpoint_lifecycle|rdma_transport|io_uring_transport|segment_desc_retry|rpc_reconnect|rpc_handler_isolation|bootstrap_response|transport_selector|runtime_queue_dispatch|engine_failover_e2e|progress_worker)_test.*)$'
+  pattern='^(segment_manager_test|request_merge_test|tent_(orbitkv_abi|orbitkv_file_io|orbitkv_file_coherence|orbitkv_c_status|tcp_transport|tcp_regression|tcp_datapath_roundtrip|local_memory_lifecycle|endpoint_lifecycle|rdma_transport|io_uring_transport|segment_desc_retry|rpc_reconnect|rpc_handler_isolation|bootstrap_response|transport_selector|runtime_queue_dispatch|engine_failover_e2e|progress_worker)_test.*)$'
 fi
 cmake --build "$build_dir" --target "${targets[@]}" --parallel "$jobs"
 mkdir -p "$build_dir/test-results/gtest"

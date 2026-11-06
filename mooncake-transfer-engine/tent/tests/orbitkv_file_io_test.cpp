@@ -4,13 +4,18 @@
 #include <gtest/gtest.h>
 
 #include <fcntl.h>
+#include <linux/magic.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -19,6 +24,7 @@
 #include "tent/platform/cpu.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transfer_engine.h"
+#include "tent/transport/io_uring/io_uring_transport.h"
 
 using namespace mooncake::tent;
 using namespace std::chrono_literals;
@@ -100,6 +106,8 @@ class CompletionFault : public Transport {
     std::atomic<bool> hold_close{false}, fail_close{false};
     std::atomic<int> closes{0};
     std::atomic<int> polls{0}, submits{0}, frees{0};
+    bool record_file_modes{false};
+    std::vector<int> submitted_file_flags;
     std::weak_ptr<File> opened;
     Status openFile(int fd, FileRef& file) override {
         auto s = real->openFile(fd, file);
@@ -119,7 +127,18 @@ class CompletionFault : public Transport {
     Status submitTransferTasks(SubBatchRef b,
                                const std::vector<Request>& r) override {
         ++submits;
-        return real->submitTransferTasks(b, r);
+        auto status = real->submitTransferTasks(b, r);
+        if (record_file_modes && status.ok()) {
+            // Each staged window owns a fresh ring with one SQE. Inspect the
+            // actual submitted fd, not the range-alignment selection rule.
+            // The kernel consumes SQEs without changing their contents.
+            auto* native = dynamic_cast<IOUringSubBatch*>(b);
+            if (!native || r.size() != 1)
+                return Status::InternalError("Expected one staged file SQE");
+            submitted_file_flags.push_back(
+                fcntl(native->ring.sq.sqes[0].fd, F_GETFL));
+        }
+        return status;
     }
     Status getTransferStatus(SubBatchRef b, int i, TransferStatus& s) override {
         ++polls;
@@ -169,6 +188,11 @@ class FileCApi : public testing::Test {
     std::vector<tent_file_batch_t> batches;
     std::shared_ptr<CompletionFault> fault;
 
+    virtual const char* testDirectory() const {
+        const char* directory = std::getenv("TENT_FILE_TEST_DIR");
+        return directory ? directory : "/dev/shm";
+    }
+
     void SetUp() override {
         configure();
         auto o = options();
@@ -180,10 +204,8 @@ class FileCApi : public testing::Test {
                           ->fileIO()
                           ->replaceUringForTest(fault);
         ASSERT_NE(fault->real, nullptr);
-        const char* directory = std::getenv("TENT_FILE_TEST_DIR");
         const std::string pattern =
-            std::string(directory ? directory : "/dev/shm") +
-            "/tent-file-c-XXXXXX";
+            std::string(testDirectory()) + "/tent-file-c-XXXXXX";
         std::vector<char> name(pattern.begin(), pattern.end());
         name.push_back('\0');
         fd = mkstemp(name.data());
@@ -278,6 +300,154 @@ class FileCApi : public testing::Test {
         ASSERT_GT(fault->polls, 0);
     }
 };
+
+// Kept in a separate CTest invocation: tmpfs/overlayfs cannot qualify this
+// contract. A missing required facility is a failure, never a skip.
+class FileDirectCoherence : public FileCApi {
+   protected:
+    const char* testDirectory() const override {
+        const char* directory = std::getenv("TENT_FILE_DIRECT_DIR");
+        return directory ? directory : "/tmp";
+    }
+    void SetUp() override {
+        const char* required = std::getenv("TENT_FILE_REQUIRE_DIRECT");
+        ASSERT_STREQ(required ? required : "", "1")
+            << "Set TENT_FILE_REQUIRE_DIRECT=1 and TENT_FILE_DIRECT_DIR to "
+               "an O_DIRECT-capable ext4/XFS directory";
+        FileCApi::SetUp();
+        ASSERT_FALSE(HasFatalFailure());
+        struct statfs fs{};
+        ASSERT_EQ(fstatfs(fd, &fs), 0);
+        ASSERT_TRUE(fs.f_type == EXT4_SUPER_MAGIC ||
+                    fs.f_type == XFS_SUPER_MAGIC)
+            << "Required coherence gate needs ext4/XFS, not tmpfs/overlayfs; "
+            << "filesystem magic=" << std::hex << fs.f_type;
+        const int direct = ::open(path.c_str(), O_RDWR | O_DIRECT | O_CLOEXEC);
+        ASSERT_GE(direct, 0)
+            << "Required O_DIRECT open failed: " << strerror(errno);
+        const int flags = fcntl(direct, F_GETFL);
+        EXPECT_EQ(::close(direct), 0);
+        ASSERT_GE(flags, 0);
+        ASSERT_NE(flags & O_DIRECT, 0);
+        fault->submitted_file_flags.reserve(8);
+        fault->record_file_modes = true;
+    }
+    void completed(tent_file_batch_t batch, uint64_t bytes) {
+        const auto result = finish(batch);
+        ASSERT_EQ(result.drained, 1u);
+        ASSERT_EQ(result.outcome, TENT_FILE_OK);
+        ASSERT_EQ(result.transferred_bytes, bytes);
+        EXPECT_EQ(fileIO()->stagingBytesForTest(), 0u);
+    }
+    void modes(std::initializer_list<bool> expected) {
+        ASSERT_EQ(fault->submitted_file_flags.size(), expected.size());
+        size_t i = 0;
+        for (bool direct : expected) {
+            const int flags = fault->submitted_file_flags[i++];
+            ASSERT_GE(flags, 0);
+            EXPECT_EQ((flags & O_DIRECT) != 0, direct) << "submission " << i;
+        }
+    }
+};
+
+TEST_F(FileDirectCoherence, OddBufferedWriteThenEnclosingDirectRead) {
+    auto f = open();
+    auto source = buffer(8192), destination = buffer(8192);
+    auto* data = static_cast<unsigned char*>(source->bytes);
+    memset(data, 0x31, 8192);
+    ASSERT_NO_FATAL_FAILURE(
+        completed(submitv(f, OPCODE_WRITE, 0,
+                          {{TENT_FILE_ELEMENT_RANGE, data, 8192}}, *source),
+                  8192));
+    std::vector<unsigned char> expected(8192, 0x31);
+    for (size_t i = 0; i < 1117; ++i)
+        expected[37 + i] = data[1 + i] = (i * 17 + 7) % 251;
+    ASSERT_NO_FATAL_FAILURE(
+        completed(submitv(f, OPCODE_WRITE, 37,
+                          {{TENT_FILE_ELEMENT_RANGE, data + 1, 1117}}, *source),
+                  1117));
+    // No fsync, fadvise or cache drop: the direct READ must flush dirty
+    // buffered data before reading the enclosing aligned extent.
+    ASSERT_NO_FATAL_FAILURE(
+        completed(submitv(f, OPCODE_READ, 0,
+                          {{TENT_FILE_ELEMENT_RANGE, destination->bytes, 8192}},
+                          *destination),
+                  8192));
+    ASSERT_NO_FATAL_FAILURE(modes({true, false, true}));
+    const auto* actual = static_cast<unsigned char*>(destination->bytes);
+    for (size_t i = 0; i < expected.size(); ++i)
+        ASSERT_EQ(actual[i], expected[i]) << i;
+}
+
+TEST_F(FileDirectCoherence, DirectWriteInvalidatesWarmBufferedRead) {
+    auto f = open();
+    auto source = buffer(8192), destination = buffer(4096);
+    auto* data = static_cast<unsigned char*>(source->bytes);
+    auto* actual = static_cast<unsigned char*>(destination->bytes);
+    memset(data, 0x43, 8192);
+    ASSERT_NO_FATAL_FAILURE(
+        completed(submitv(f, OPCODE_WRITE, 0,
+                          {{TENT_FILE_ELEMENT_RANGE, data, 8192}}, *source),
+                  8192));
+    // Populate the buffered cache with OLD bytes before the direct overwrite.
+    ASSERT_NO_FATAL_FAILURE(completed(
+        submitv(f, OPCODE_READ, 37,
+                {{TENT_FILE_ELEMENT_RANGE, actual + 1, 1117}}, *destination),
+        1117));
+    for (size_t i = 1; i <= 1117; ++i) ASSERT_EQ(actual[i], 0x43) << i;
+    for (size_t i = 0; i < 8192; ++i) data[i] = (i * 29 + 11) % 251;
+    ASSERT_NO_FATAL_FAILURE(
+        completed(submitv(f, OPCODE_WRITE, 0,
+                          {{TENT_FILE_ELEMENT_RANGE, data, 8192}}, *source),
+                  8192));
+    memset(actual, 0xac, 4096);
+    ASSERT_NO_FATAL_FAILURE(completed(
+        submitv(f, OPCODE_READ, 37,
+                {{TENT_FILE_ELEMENT_RANGE, actual + 1, 1117}}, *destination),
+        1117));
+    ASSERT_NO_FATAL_FAILURE(modes({true, false, true, false}));
+    for (size_t i = 0; i < 4096; ++i)
+        ASSERT_EQ(actual[i], i >= 1 && i <= 1117 ? data[36 + i] : 0xac) << i;
+}
+
+TEST_F(FileDirectCoherence, StagedWindowsSwitchDirectToBufferedThenReadBack) {
+    constexpr size_t window = 4 << 20, enclosing = window + 4096;
+    auto f = largeFile(enclosing);
+    auto source = buffer(window + 8192), destination = buffer(enclosing);
+    auto* data = static_cast<unsigned char*>(source->bytes);
+    memset(data, 0x95, enclosing);
+    ASSERT_NO_FATAL_FAILURE(completed(
+        submitv(f, OPCODE_WRITE, 0,
+                {{TENT_FILE_ELEMENT_RANGE, data, enclosing}}, *source),
+        enclosing));
+    fault->submitted_file_flags.clear();
+    std::vector<unsigned char> expected(enclosing, 0x95);
+    for (size_t i = 0; i < window - 5; ++i)
+        expected[i] = data[1 + i] = (i * 13 + 5) % 251;
+    std::fill(expected.begin() + window - 5, expected.begin() + window + 37, 0);
+    for (size_t i = 0; i < 23; ++i)
+        expected[window + 4 + i] = data[window + 32 + i] = 0xe0 + i;
+    // A 4 MiB direct window followed by a 37-byte buffered window. Padding
+    // crosses the window boundary; the enclosing tail must remain unchanged.
+    ASSERT_NO_FATAL_FAILURE(
+        completed(submitv(f, OPCODE_WRITE, 0,
+                          {{TENT_FILE_ELEMENT_RANGE, data + 1, window - 5},
+                           {TENT_FILE_ELEMENT_PADDING, nullptr, 9},
+                           {TENT_FILE_ELEMENT_RANGE, data + window + 32, 23},
+                           {TENT_FILE_ELEMENT_PADDING, nullptr, 10}},
+                          *source),
+                  window + 37));
+    ASSERT_NO_FATAL_FAILURE(modes({true, false}));
+    ASSERT_NO_FATAL_FAILURE(completed(
+        submitv(f, OPCODE_READ, 0,
+                {{TENT_FILE_ELEMENT_RANGE, destination->bytes, enclosing}},
+                *destination),
+        enclosing));
+    ASSERT_NO_FATAL_FAILURE(modes({true, false, true, true}));
+    const auto* actual = static_cast<unsigned char*>(destination->bytes);
+    for (size_t i = 0; i < expected.size(); ++i)
+        ASSERT_EQ(actual[i], expected[i]) << i;
+}
 
 TEST_F(FileCApi, VectorsRoundTripThroughCTranslationUnit) {
     auto f = open();

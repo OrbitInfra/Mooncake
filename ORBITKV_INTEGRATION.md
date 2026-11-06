@@ -503,6 +503,16 @@ filesystem rejects opening O_DIRECT). It never rounds a WRITE outward or
 performs read/modify/write on neighboring bytes. The generic upstream file
 context is unchanged; this is a fork file-API capability extension.
 
+On Linux ext4/XFS, buffered/direct coherence for **sequential batches that do
+not overlap in time** relies on the kernel's direct-I/O page-cache
+flush/invalidate: direct reads flush earlier dirty buffered data, and direct
+writes invalidate cached data. Wait for full-byte success with `drained=1`
+before submitting a dependent batch. TENT needs no explicit fsync or cache
+drop for this visibility guarantee; this does **not** provide fsync durability.
+Concurrent overlapping batches and external accesses to the same bytes remain
+the caller's synchronization contract; TENT adds no cross-batch range lock.
+See the Linux [direct-I/O semantics](https://docs.kernel.org/6.12/filesystems/iomap/operations.html#direct-reads).
+
 Admission is bounded per engine: 256 open/opening/retained files, 32 live batch
 receipts, 16384 input ranges and 64 MiB per batch. Active and uncertain batches
 continue consuming their slot and byte allowance; even a completed receipt
@@ -627,7 +637,7 @@ failed cleanup retaining scratch, and shared-budget exhaustion/recovery.
 The GPU shim drives the production FileIO owner and real io_uring bytes; it
 does not claim a physical GPU copy or native GDS route.
 
-Padding/vector validation on the Linux container described below, with
+Padding/vector validation at `54d06225` on the Linux container described below, with
 `--security-opt seccomp=unconfined`: 22/22 CPU CTest entries passed (523 case
 invocations: 520 passed, three RDMA availability/hardware skips). The expanded
 file suite passed **26 cases × 50 repetitions on each filesystem**, 2600 total
@@ -636,8 +646,8 @@ invocations with no failures or skips. The full TCP stress passed **13 cases ×
 these were the repeated commands inside the container:
 
 ```bash
-.git/validation/build-linux/tent/tests/tent_orbitkv_file_io_test --gtest_repeat=50
-TENT_FILE_TEST_DIR=/tmp .git/validation/build-linux/tent/tests/tent_orbitkv_file_io_test --gtest_repeat=50
+.git/validation/build-linux/tent/tests/tent_orbitkv_file_io_test --gtest_filter=FileCApi.* --gtest_repeat=50
+TENT_FILE_TEST_DIR=/tmp .git/validation/build-linux/tent/tests/tent_orbitkv_file_io_test --gtest_filter=FileCApi.* --gtest_repeat=50
 .git/validation/build-linux/tent/tests/tent_tcp_regression_test --gtest_repeat=200
 ```
 
@@ -646,6 +656,38 @@ The padding extension's logs and counts are under
 same 26 file cases on both filesystems in its CPU leg, and compiles the new
 API with CUDA/cuFile in its CUDA leg. Actual GPU copies and GDS routes remain
 unverified without hardware.
+
+The separate `tent_orbitkv_file_coherence_test` CTest entry selects
+`FileDirectCoherence.*` in the same real C API executable. It always sets
+`TENT_FILE_REQUIRE_DIRECT=1`; `TENT_FILE_DIRECT_DIR` selects its filesystem
+(default `/tmp`). The gate **fails**, rather than skipping, if the switch is
+absent in a direct executable invocation, the filesystem is not ext4/XFS,
+O_DIRECT cannot be opened, or a submitted descriptor uses the wrong I/O mode.
+Hosted CPU CI provisions a dedicated ext4 loop image so tmpfs
+and overlayfs cannot accidentally satisfy this gate.
+
+The three controls byte-check an odd buffered WRITE followed by an enclosing
+direct READ; a direct overwrite followed by an odd buffered READ after warming
+the cache with old bytes; and one staged WRITE whose 4 MiB direct window is
+followed by a 37-byte buffered tail, then a full aligned read-back. They inspect
+the actual submitted SQE descriptors' flags. Every dependent batch starts only
+after its predecessor physically drains; no test inserts fsync, fadvise or a
+cache drop between the operations.
+
+All three controls passed 50 repetitions on a dedicated ext4 loop filesystem
+in the Linux container: **150 invocations, zero failures or skips**. Pointing
+the required gate at tmpfs returned a test failure (exit 1), confirming that
+an unsupported filesystem cannot silently pass. The existing 26 file cases
+still passed on both tmpfs and the regular container filesystem, and the ABI
+check passed. Evidence is in `.git/validation/file-coherence/`, outside Git.
+
+Run the coherence controls on a mounted ext4/XFS directory with:
+
+```bash
+TENT_FILE_REQUIRE_DIRECT=1 TENT_FILE_DIRECT_DIR=/mnt/tent-coherence \
+  .git/validation/build-linux/tent/tests/tent_orbitkv_file_io_test \
+  --gtest_filter=FileDirectCoherence.* --gtest_repeat=50
+```
 
 Initial file-API results (before the padding extension) on Debian trixie aarch64, Linux
 6.12.76-linuxkit, GCC 14.4.0, and CMake 3.31.6:
@@ -658,13 +700,19 @@ Initial file-API results (before the padding extension) on Debian trixie aarch64
 | Full TCP regression stress | 200 repetitions, 2600/2600 case invocations passed, zero failures. |
 | Scoped pre-commit, clang-format 20.1.8, CMake format, diff check | Passed. |
 
-The CPU commands were:
+To run the current CPU gate locally, mount a dedicated ext4 image inside the
+container. Mounting this test image requires container mount privileges:
 
 ```bash
-docker run --rm --security-opt seccomp=unconfined \
+docker run --rm --privileged --security-opt seccomp=unconfined \
   --mount "type=bind,source=$PWD,target=/workspace" -w /workspace \
   orbitinfra-mooncake-validation:v0314 bash -c '
-    apt-get update -qq && apt-get install -y -qq patchelf &&
+    apt-get update -qq && apt-get install -y -qq patchelf e2fsprogs &&
+    truncate -s 128M /tmp/tent-coherence.ext4 &&
+    mkfs.ext4 -F -q /tmp/tent-coherence.ext4 &&
+    mkdir -p /mnt/tent-coherence &&
+    mount -t ext4 -o loop /tmp/tent-coherence.ext4 /mnt/tent-coherence &&
+    export TENT_FILE_DIRECT_DIR=/mnt/tent-coherence TENT_FILE_REQUIRE_DIRECT=1 &&
     USE_CUDA=OFF BUILD_JOBS=2 scripts/ci/run_orbitkv_tent_checks.sh .git/validation/build-linux &&
     .git/validation/build-linux/tent/tests/tent_tcp_regression_test --gtest_repeat=200
   '

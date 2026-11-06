@@ -26,7 +26,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build libibverbs-dev libgoogle-glog-dev \
             libjsoncpp-dev libnuma-dev libyaml-cpp-dev libgflags-dev libssl-dev \
-            liburing-dev libfmt-dev libcli11-dev libunwind-dev python3-dev patchelf
+            liburing-dev libfmt-dev libcli11-dev libunwind-dev python3-dev patchelf e2fsprogs
+      - name: Prepare required ext4 coherence gate
+        if: matrix.cuda == 'OFF'
+        run: |
+          image="$RUNNER_TEMP/tent-coherence.ext4"
+          directory="$RUNNER_TEMP/tent-coherence"
+          truncate -s 128M "$image"
+          sudo mkfs.ext4 -F -q "$image"
+          mkdir -p "$directory"
+          sudo mount -t ext4 -o loop "$image" "$directory"
+          sudo chown "$(id -u):$(id -g)" "$directory"
+          findmnt -n -o FSTYPE,SOURCE,TARGET "$directory"
+          echo "TENT_FILE_DIRECT_DIR=$directory" >> "$GITHUB_ENV"
+          echo 'TENT_FILE_REQUIRE_DIRECT=1' >> "$GITHUB_ENV"
       - name: Install CUDA 13 toolkit for compile and injected tests
         if: matrix.cuda == 'ON'
         uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
@@ -65,3 +78,10 @@ jobs:
             build-orbitkv/Testing/Temporary/
             build-orbitkv/test-results/
           if-no-files-found: warn
+      - name: Unmount coherence filesystem
+        if: always() && matrix.cuda == 'OFF'
+        run: |
+          directory="$RUNNER_TEMP/tent-coherence"
+          if mountpoint -q "$directory"; then
+            sudo umount "$directory"
+          fi

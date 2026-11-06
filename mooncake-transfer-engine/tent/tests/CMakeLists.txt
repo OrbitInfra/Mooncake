@@ -352,9 +352,16 @@ if(TARGET tent_xport_uring)
                                            file_c_api_smoke.c)
   target_link_libraries(tent_orbitkv_file_io_test
                         PRIVATE tent_shared tent_interface gtest gtest_main)
-  add_test(NAME tent_orbitkv_file_io_test COMMAND tent_orbitkv_file_io_test)
+  add_test(NAME tent_orbitkv_file_io_test COMMAND tent_orbitkv_file_io_test
+                                                  --gtest_filter=FileCApi.*)
   add_test(NAME tent_orbitkv_file_io_test_regular_fs
-           COMMAND tent_orbitkv_file_io_test)
+           COMMAND tent_orbitkv_file_io_test --gtest_filter=FileCApi.*)
+  add_test(NAME tent_orbitkv_file_coherence_test
+           COMMAND tent_orbitkv_file_io_test
+                   --gtest_filter=FileDirectCoherence.*)
+  set_tests_properties(
+    tent_orbitkv_file_coherence_test PROPERTIES TIMEOUT 120 ENVIRONMENT
+                                                "TENT_FILE_REQUIRE_DIRECT=1")
   set_tests_properties(tent_orbitkv_file_io_test PROPERTIES TIMEOUT 120)
   set_tests_properties(
     tent_orbitkv_file_io_test_regular_fs PROPERTIES TIMEOUT 120 ENVIRONMENT

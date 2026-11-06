@@ -184,6 +184,7 @@ int tent_file_open(tent_engine_t engine, const char* uri,
 /* Up to 16384 ranges / 64 MiB, mapped consecutively from file_offset.
  * Unaligned vectors use the same bounded staging as submitv (without padding).
  * Aligned vectors retain parallel windows and sum-of-ranges byte receipts.
+ * Mixed buffered/direct coherence follows the submitv contract below.
  * READ/WRITE use OPCODE_READ/WRITE. No extension, replay, fsync or atomicity.
  * On success, retain has run and one batch owns the token until drained.
  * On rejection, no I/O or callback has run and *batch is zero. */
@@ -197,13 +198,20 @@ int tent_file_submit(tent_engine_t engine, tent_file_id_t file, int opcode,
  * owns bounded staging (4 MiB windows, 64 MiB charged per engine) through all
  * I/O and copies. io_uring accepts odd addresses, lengths and file offsets;
  * odd file extents use buffered io_uring on the same pinned inode, with no
- * read/modify/write of neighboring bytes. GDS stages on the GPU; native-only
- * still requires device RANGE elements and 4 KiB-aligned offset/total length.
- * No silent transport fallback. The original retain/release and drain rules
- * apply, including all-padding vectors. Limits: 16384 elements / 64 MiB.
- * transferred_bytes is the completed file prefix, INCLUDING padding; a short
- * READ scatters only that prefix. Copies/cleanup without a quiescence receipt
- * retain backing, staging and its budget; never replay a WRITE. */
+ * read/modify/write of neighboring bytes. On Linux ext4/XFS, coherence between
+ * sequential batches that do not overlap in time relies on Linux direct-I/O
+ * page-cache flush/invalidate. Wait for a successful, fully drained batch
+ * before submitting a dependent batch; no fsync is needed for visibility.
+ * This is not a durability guarantee. Concurrent overlapping batches (and
+ * external accesses to those bytes) remain the caller's synchronization
+ * contract; TENT adds no cross-batch range lock. GDS stages on the GPU;
+ * native-only still requires device RANGE elements and 4 KiB-aligned
+ * offset/total length. No silent transport fallback. The original
+ * retain/release and drain rules apply, including all-padding vectors. Limits:
+ * 16384 elements / 64 MiB. transferred_bytes is the completed file prefix,
+ * INCLUDING padding; a short READ scatters only that prefix. Copies/cleanup
+ * without a quiescence receipt retain backing, staging and its budget; never
+ * replay a WRITE. */
 int tent_file_submitv(tent_engine_t engine, tent_file_id_t file, int opcode,
                       uint64_t file_offset, const tent_file_element_t* elements,
                       size_t count, const tent_file_owner_t* owner,
